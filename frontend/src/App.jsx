@@ -265,6 +265,43 @@ function getWeekData(sessions) {
   return result;
 }
 
+function getStudyPeriodDays(sessions, days, endDate = new Date()) {
+  return Array.from({ length: days }, (_, index) => {
+    const date = shiftLocalDate(endDate, index - days + 1);
+    const key = getLocalDateKey(date);
+    return {
+      key,
+      label: days === 7
+        ? date.toLocaleDateString(undefined, { weekday: "short" })
+        : date.toLocaleDateString(undefined, { month: "short", day: "numeric" }),
+      total: getMinutesForDate(sessions, key),
+      isToday: key === getTodayKey(),
+    };
+  });
+}
+
+function getStudyPeriodBuckets(days, dailyGoal) {
+  if (days.length <= 7) return days.map((day) => ({ ...day, goal: dailyGoal }));
+
+  const buckets = [];
+  for (let index = 0; index < days.length; index += 7) {
+    const block = days.slice(index, index + 7);
+    const startDate = new Date(`${block[0].key}T00:00:00`);
+    const endDate = new Date(`${block[block.length - 1].key}T00:00:00`);
+    const startLabel = startDate.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    const endLabel = endDate.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    const sameMonth = startDate.getMonth() === endDate.getMonth();
+    buckets.push({
+      key: block[0].key,
+      label: sameMonth ? `${startDate.toLocaleDateString(undefined, { month: "short" })} ${startDate.getDate()}–${endDate.getDate()}` : `${startLabel}–${endLabel}`,
+      total: block.reduce((sum, day) => sum + day.total, 0),
+      goal: dailyGoal * block.length,
+      isToday: block.some((day) => day.isToday),
+    });
+  }
+  return buckets;
+}
+
 // A streak only counts if the student studied today or yesterday.
 function getEffectiveStreak(profile) {
   const streak = Number(profile?.streak) || 0;
@@ -1825,6 +1862,51 @@ body { font-size: 15px; line-height: 1.6; }
 @media (prefers-reduced-motion: reduce) {
   .wb-col i, .chip-btn, .pw-toggle, .sf-app .primary-btn::after { transition-duration: .01ms; }
 }
+
+.sf-app .page-dashboard .panel,
+.sf-app .page-progress .panel {
+  background:
+    linear-gradient(135deg, rgba(255,255,255,.11), rgba(255,255,255,.035) 52%, rgba(var(--theme-rgb, 167,139,250),.055)),
+    rgba(11,15,27,.58);
+  border-color: rgba(255,255,255,.14);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.13), 0 18px 48px rgba(0,0,0,.18);
+  backdrop-filter: blur(24px) saturate(145%);
+  -webkit-backdrop-filter: blur(24px) saturate(145%);
+}
+.sf-app.light .page-dashboard .panel,
+.sf-app.light .page-progress .panel {
+  background: linear-gradient(135deg, rgba(255,255,255,.92), rgba(255,255,255,.68) 55%, rgba(var(--theme-rgb, 124,92,255),.06));
+  border-color: rgba(255,255,255,.82);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.9), 0 16px 42px rgba(45,55,85,.1);
+}
+.sf-app .page-dashboard .panel:hover,
+.sf-app .page-progress .panel:hover {
+  border-color: rgba(var(--theme-rgb, 167,139,250),.3);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.14), 0 22px 52px rgba(0,0,0,.21), 0 0 26px rgba(var(--theme-rgb, 167,139,250),.06);
+}
+.sf-app .progress-overview-panel { overflow: hidden; }
+.sf-app .progress-overview-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
+.sf-app .progress-range { display: inline-flex; gap: 4px; padding: 4px; border: 1px solid rgba(255,255,255,.1); border-radius: 13px; background: rgba(5,8,16,.32); }
+.sf-app .progress-range button { padding: 8px 12px; border: 0; border-radius: 9px; background: transparent; color: #aeb6c9; font-size: 13px; font-weight: 700; transition: background .18s ease, color .18s ease, box-shadow .18s ease; }
+.sf-app .progress-range button:hover { color: #fff; background: rgba(255,255,255,.07); }
+.sf-app .progress-range button.active { color: #fff; background: linear-gradient(135deg, rgba(var(--theme-rgb, 167,139,250),.48), rgba(var(--theme-rgb, 167,139,250),.22)); box-shadow: inset 0 1px 0 rgba(255,255,255,.16), 0 5px 14px rgba(var(--theme-rgb, 167,139,250),.12); }
+.sf-app .progress-range button:focus-visible { outline: 2px solid var(--theme-primary, #a78bfa); outline-offset: 2px; }
+.sf-app .progress-trend { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 2px 0 4px; padding: 8px 11px; border: 1px solid rgba(255,255,255,.08); border-radius: 11px; background: rgba(255,255,255,.035); color: #c9cddd; font-size: 13px; }
+.sf-app .progress-trend-icon { font-size: 17px; font-weight: 800; }
+.sf-app .progress-trend.up .progress-trend-icon { color: #6ee7b7; }
+.sf-app .progress-trend.down .progress-trend-icon { color: #fda4af; }
+.sf-app .progress-trend.steady .progress-trend-icon { color: var(--theme-primary, #c4b5fd); }
+.sf-app.light .progress-range { border-color: rgba(44,52,78,.12); background: rgba(255,255,255,.58); }
+.sf-app.light .progress-range button { color: #515a70; }
+.sf-app.light .progress-range button:hover { color: #252b3c; background: rgba(44,52,78,.07); }
+.sf-app.light .progress-range button.active { color: #252039; }
+.sf-app.light .progress-trend { color: #343b50; border-color: rgba(44,52,78,.1); background: rgba(255,255,255,.48); }
+@media(max-width: 640px) {
+  .sf-app .progress-overview-heading { align-items: flex-start; flex-direction: column; }
+  .sf-app .progress-range { width: 100%; }
+  .sf-app .progress-range button { flex: 1; }
+  .sf-app .progress-trend { align-items: flex-start; }
+}
 `;
 
 /* -----------------------------------------------------------
@@ -1962,7 +2044,7 @@ function Layout({ children, page, navigate, dark, setDark, syncStatus, retrySync
           </button>
         </aside>
 
-        <main className="content"><div className="content-view" key={page}>{children}</div></main>
+        <main className="content"><div className={`content-view page-${page}`} key={page}>{children}</div></main>
       </div>
 
       <div className="mobile-nav">
@@ -2422,16 +2504,18 @@ function StudentSetup({ profile, onContinue, theme }) {
    DASHBOARD
 ----------------------------------------------------------- */
 
-function WeekBars({ data, goal, tall }) {
-  const max = Math.max(goal, ...data.map((day) => day.total), 1);
+function WeekBars({ data, goal, tall, periodDays = 7 }) {
+  const goals = data.map((day) => day.goal ?? goal);
+  const max = Math.max(1, ...data.flatMap((day, index) => [day.total, goals[index]]));
+  const showGoalLine = goals.every((value) => value === goals[0]);
   return (
-    <div className={"wb" + (tall ? " tall" : "")} role="img" aria-label={`Study minutes for the last 7 days against a ${goal} minute goal`}>
+    <div className={"wb" + (tall ? " tall" : "")} role="img" aria-label={`Study minutes for the last ${periodDays} days against a ${goal} minute daily goal`}>
       <div className="wb-plot">
-        <span className="wb-goal" style={{ bottom: `${(goal / max) * 100}%` }}><em>{goal} min goal</em></span>
-        {data.map((day) => (
-          <div className="wb-col" key={day.key} title={`${day.label}: ${day.total} min`}>
+        {showGoalLine && <span className="wb-goal" style={{ bottom: `${(goals[0] / max) * 100}%` }}><em>{goals[0]} min goal</em></span>}
+        {data.map((day, index) => (
+          <div className="wb-col" key={day.key} title={`${day.label}: ${day.total} min · ${goals[index]} min goal`}>
             <i
-              className={(day.total === 0 ? "empty " : "") + (day.total >= goal ? "met " : "") + (day.isToday ? "today" : "")}
+              className={(day.total === 0 ? "empty " : "") + (day.total >= goals[index] ? "met " : "") + (day.isToday ? "today" : "")}
               style={{ height: day.total ? `${Math.max(6, (day.total / max) * 100)}%` : undefined }}
             />
           </div>
@@ -3266,6 +3350,7 @@ function Progress({ profile, setProfile, tasks, subjects, studySessions, notify,
   const [minutes, setMinutes] = useState("");
   const [customGoal, setCustomGoal] = useState("");
   const [sessionType, setSessionType] = useState("Focus");
+  const [rangeDays, setRangeDays] = useState(7);
   const today = getTodayKey();
 
   const todayMinutes = getMinutesForDate(studySessions, today);
@@ -3281,11 +3366,21 @@ function Progress({ profile, setProfile, tasks, subjects, studySessions, notify,
   const nextMilestone = getNextMilestone(streak);
   const studiedToday = profile.lastStudyDate === today;
 
-  const weekData = useMemo(() => getWeekData(studySessions), [studySessions]);
-  const weekTotal = weekData.reduce((sum, day) => sum + day.total, 0);
-  const weekAverage = Math.round(weekTotal / 7);
-  const bestDay = weekData.reduce((best, day) => (day.total > best.total ? day : best), weekData[0]);
-  const goalDays = weekData.filter((day) => day.total >= goal).length;
+  const periodDays = useMemo(() => getStudyPeriodDays(studySessions, rangeDays), [studySessions, rangeDays]);
+  const previousPeriodDays = useMemo(
+    () => getStudyPeriodDays(studySessions, rangeDays, shiftLocalDate(new Date(), -rangeDays)),
+    [studySessions, rangeDays]
+  );
+  const periodBuckets = useMemo(() => getStudyPeriodBuckets(periodDays, goal), [periodDays, goal]);
+  const periodTotal = periodDays.reduce((sum, day) => sum + day.total, 0);
+  const previousPeriodTotal = previousPeriodDays.reduce((sum, day) => sum + day.total, 0);
+  const periodAverage = Math.round(periodTotal / rangeDays);
+  const bestBlock = periodBuckets.reduce((best, block) => (block.total > best.total ? block : best), periodBuckets[0]);
+  const goalDays = periodDays.filter((day) => day.total >= goal).length;
+  const trendDirection = periodTotal > previousPeriodTotal ? "up" : periodTotal < previousPeriodTotal ? "down" : "steady";
+  const trendText = previousPeriodTotal === 0
+    ? periodTotal > 0 ? "New study time this period" : "No study time in either period"
+    : `${Math.round(((periodTotal - previousPeriodTotal) / previousPeriodTotal) * 100) > 0 ? "+" : ""}${Math.round(((periodTotal - previousPeriodTotal) / previousPeriodTotal) * 100)}% vs previous ${rangeDays}-day period`;
 
   const recordMinutes = (raw) => {
     const value = Math.round(Number(raw));
@@ -3425,18 +3520,33 @@ function Progress({ profile, setProfile, tasks, subjects, studySessions, notify,
         </div>
       </div>
 
-      <div className="panel" style={{ marginTop: 16 }}>
-        <div className="row">
-          <h2 className="card-title">Session health</h2>
-          <span className="tag">{studySessions.filter((session) => session.date === today).length} entries today</span>
+      <section className="panel progress-overview-panel" aria-label="Study progress overview" style={{ marginTop: 16 }}>
+        <div className="progress-overview-heading">
+          <div>
+            <div className="eyebrow">Progress overview</div>
+            <h2 className="card-title" style={{ margin: "3px 0 0" }}>Study time and consistency</h2>
+          </div>
+          <div className="progress-range" role="group" aria-label="Progress date range">
+            {[7, 30, 90].map((days) => (
+              <button key={days} type="button" aria-pressed={rangeDays === days} className={rangeDays === days ? "active" : ""} onClick={() => setRangeDays(days)}>
+                {days} days
+              </button>
+            ))}
+          </div>
         </div>
         <div className="week-stats">
-          <div className="week-stat"><span>Total this week</span><b>{weekTotal} min</b></div>
-          <div className="week-stat"><span>Daily average</span><b>{weekAverage} min</b></div>
-          <div className="week-stat"><span>Best day</span><b>{bestDay.total ? `${bestDay.isToday ? "Today" : bestDay.label} · ${bestDay.total}m` : "None yet"}</b></div>
-          <div className="week-stat"><span>Goal reached</span><b>{goalDays}/7 days</b></div>
+          <div className="week-stat"><span>Total · {rangeDays} days</span><b>{periodTotal} min</b></div>
+          <div className="week-stat"><span>Daily average</span><b>{periodAverage} min</b></div>
+          <div className="week-stat"><span>{rangeDays === 7 ? "Best day" : "Best block"}</span><b>{bestBlock?.total ? `${bestBlock.label} · ${bestBlock.total}m` : "None yet"}</b></div>
+          <div className="week-stat"><span>Daily goals reached</span><b>{goalDays}/{rangeDays} days</b></div>
         </div>
-      </div>
+        <div className={`progress-trend ${trendDirection}`} role="status" aria-live="polite">
+          <span className="progress-trend-icon" aria-hidden="true">{trendDirection === "up" ? "↗" : trendDirection === "down" ? "↘" : "→"}</span>
+          <span>{trendText}</span>
+          <span className="muted">{previousPeriodTotal} min in the preceding {rangeDays} days</span>
+        </div>
+        <WeekBars data={periodBuckets} goal={goal} tall periodDays={rangeDays} />
+      </section>
 
       <div className="panel" style={{ marginTop: 16 }}>
         <h2 className="card-title">Recent study sessions</h2>
@@ -3457,11 +3567,6 @@ function Progress({ profile, setProfile, tasks, subjects, studySessions, notify,
             ))}
           {!studySessions.length && <div className="empty">No study sessions logged yet. Start with a 15-minute focus block.</div>}
         </div>
-      </div>
-
-      <div className="panel" style={{ marginTop: 16 }}>
-        <h2 className="card-title">Weekly Study Time</h2>
-        <WeekBars data={weekData} goal={goal} tall />
       </div>
 
       <div className="panel" style={{ marginTop: 16 }}>
