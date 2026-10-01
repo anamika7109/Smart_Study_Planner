@@ -115,6 +115,50 @@ function getLegacyPlanner() {
   };
 }
 
+function saveLegacyPlanner(profile, data, dashboardPrefs, flashcardReviews) {
+  const payload = {
+    profile: profile || initialProfile,
+    data: data || initialData,
+    dashboardPrefs: dashboardPrefs || initialDashboardPrefs,
+    flashcardReviews: flashcardReviews || {},
+  };
+  try {
+    localStorage.setItem("studyFlowProfile", JSON.stringify(payload.profile));
+    localStorage.setItem("studyFlowDataV2", JSON.stringify(payload.data));
+    localStorage.setItem("studyFlowDashboardPrefs", JSON.stringify(payload.dashboardPrefs));
+    localStorage.setItem("studyFlowFlashcardReviews", JSON.stringify(payload.flashcardReviews));
+  } catch (error) {
+    console.warn("Could not save the local planner backup.", error);
+  }
+  return payload;
+}
+
+function createLocalFallbackPlanner(email = null, profileOverrides = {}) {
+  const legacy = getLegacyPlanner();
+  const nextProfile = {
+    ...initialProfile,
+    ...legacy.profile,
+    ...profileOverrides,
+    name: profileOverrides.name || legacy.profile?.name || "Student",
+    email: undefined,
+  };
+  const planner = {
+    profile: nextProfile,
+    data: legacy.data,
+    dashboardPrefs: legacy.dashboardPrefs,
+    flashcardReviews: legacy.flashcardReviews,
+  };
+  return {
+    account: {
+      id: `local-${Date.now()}`,
+      isGuest: email === null,
+      email,
+    },
+    profile: nextProfile,
+    planner,
+  };
+}
+
 function clearLegacyLocalValues() {
   let cleared = true;
   ["studyFlowProfile", "studyFlowDataV2", "studyFlowDashboardPrefs", "studyFlowFlashcardReviews"]
@@ -176,7 +220,100 @@ function daysUntil(date) {
 }
 
 function getTodayKey() {
-  return new Date().toISOString().slice(0, 10);
+  // Local calendar date. toISOString() is UTC and shifts the day for IST users
+  // between 12:00 AM and 5:30 AM.
+  return getLocalDateKey(new Date());
+}
+
+function newId() {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+async function readJson(response) {
+  try {
+    return await response.json();
+  } catch {
+    return {};
+  }
+}
+
+function getMinutesForDate(sessions, key) {
+  return (sessions || [])
+    .filter((session) => session?.date === key)
+    .reduce((sum, session) => sum + (Number(session.minutes) || 0), 0);
+}
+
+function getSessionTypeLabel(session) {
+  const value = typeof session?.type === "string" ? session.type.trim() : "";
+  return value || "Focus";
+}
+
+function getWeekData(sessions) {
+  const today = new Date();
+  const result = [];
+  for (let i = 6; i >= 0; i--) {
+    const date = shiftLocalDate(today, -i);
+    const key = getLocalDateKey(date);
+    result.push({
+      key,
+      label: date.toLocaleDateString(undefined, { weekday: "short" }),
+      total: getMinutesForDate(sessions, key),
+      isToday: i === 0,
+    });
+  }
+  return result;
+}
+
+// A streak only counts if the student studied today or yesterday.
+function getEffectiveStreak(profile) {
+  const streak = Number(profile?.streak) || 0;
+  if (!streak || !profile?.lastStudyDate) return 0;
+  const today = new Date();
+  if (profile.lastStudyDate === getLocalDateKey(today)) return streak;
+  if (profile.lastStudyDate === getLocalDateKey(shiftLocalDate(today, -1))) return streak;
+  return 0;
+}
+
+function getNextMilestone(streak) {
+  return [3, 7, 14, 30, 60, 100, 180, 365].find((m) => m > streak) || streak + 100;
+}
+
+function getPasswordStrength(password) {
+  if (!password) return { score: 0, label: "" };
+  if (password.length < 12) return { score: 0, label: "Too short" };
+  let score = 1;
+  if (password.length >= 16) score += 1;
+  if (/[a-z]/.test(password) && /[A-Z]/.test(password)) score += 1;
+  if (/\d/.test(password) && /[^A-Za-z0-9]/.test(password)) score += 1;
+  return { score, label: ["", "Fair", "Good", "Strong", "Excellent"][score] };
+}
+
+const MAX_LOGIN_ATTEMPTS = 4;
+const LOGIN_LOCK_MS = 5 * 60 * 1000;
+const loginGuardKey = "studyFlowLoginGuard";
+
+function readLoginGuard() {
+  try {
+    const guard = JSON.parse(window.localStorage.getItem(loginGuardKey) || "null");
+    if (guard && guard.lockedUntil > Date.now()) {
+      return { failed: MAX_LOGIN_ATTEMPTS, lockedUntil: Number(guard.lockedUntil) };
+    }
+    if (guard && !guard.lockedUntil && guard.failed > 0) {
+      return { failed: Math.min(Number(guard.failed) || 0, MAX_LOGIN_ATTEMPTS - 1), lockedUntil: 0 };
+    }
+  } catch (error) {
+    console.warn("Could not read the login attempt counter.", error);
+  }
+  return { failed: 0, lockedUntil: 0 };
+}
+
+function writeLoginGuard(guard) {
+  try {
+    window.localStorage.setItem(loginGuardKey, JSON.stringify(guard));
+  } catch (error) {
+    console.warn("Could not save the login attempt counter.", error);
+  }
 }
 
 function getIndiaTimeGreeting() {
@@ -248,8 +385,25 @@ h1, h2, h3, h4, .brand, .stat-value, .card-title, .timer-face, .goal-number, .pr
 .danger-btn { color: #ff8da1; }
 .icon-btn { width: 42px; height: 42px; padding: 0; }
 
-.shell { display: flex; min-height: calc(100vh - 72px); }
-.sidebar { width: 245px; padding: 22px 14px; border-right: 1px solid #20263b; background: rgba(7,9,20,.55); backdrop-filter: blur(18px); position: sticky; top: 72px; height: calc(100vh - 72px); overflow-y: auto; }
+.shell {
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  min-height: calc(100vh - 72px);
+}
+.sidebar {
+  width: 245px;
+  padding: 22px 14px;
+  border-right: 1px solid #20263b;
+  background: rgba(7,9,20,.55);
+  backdrop-filter: blur(18px);
+  position: sticky;
+  left: 0;
+  top: 72px;
+  height: calc(100vh - 72px);
+  overflow-y: auto;
+  flex-shrink: 0;
+}
 .nav-section { font-size: 11px; color: #66708a; text-transform: uppercase; letter-spacing: 1.3px; padding: 14px 12px 7px; }
 .nav-btn { display: flex; width: 100%; align-items: center; gap: 11px; padding: 11px 12px; margin: 3px 0; border: 0; border-radius: 11px; background: transparent; color: #9ca6bd; text-align: left; }
 .nav-btn:hover { background: rgba(124,92,255,.08); }
@@ -265,19 +419,38 @@ h1, h2, h3, h4, .brand, .stat-value, .card-title, .timer-face, .goal-number, .pr
 .stats { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .two { grid-template-columns: 1.45fr 1fr; }
 .three { grid-template-columns: repeat(3, 1fr); }
-.panel { background: rgba(14,18,33,.78); border: 1px solid #222a42; border-radius: 20px; padding: 20px; box-shadow: 0 18px 50px rgba(0,0,0,.18); }
+.panel {
+  position: relative;
+  background: linear-gradient(180deg, rgba(20, 24, 38, 0.8), rgba(12, 15, 25, 0.7));
+  border: 1px solid rgba(255,255,255,0.09);
+  border-radius: 24px;
+  padding: 20px;
+  box-shadow: 0 18px 50px rgba(0,0,0,.18), inset 0 1px 0 rgba(255,255,255,.04);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
 .stat-value { font: 700 29px "Manrope", sans-serif; margin: 8px 0; }
 .stat-label { color: #8993aa; font-size: 13px; }
 .card-title { font: 700 17px "Manrope", sans-serif; letter-spacing: -.02em; margin: 0 0 15px; }
 
-.progress { height: 8px; background: #20273b; border-radius: 99px; overflow: hidden; }
+.progress { height: 8px; background: rgba(255,255,255,0.08); border-radius: 99px; overflow: hidden; }
 .bar { height: 100%; border-radius: 99px; background: linear-gradient(90deg, #7c5cff, #22d3ee); transition: width .4s ease; }
 .row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 .list { display: grid; gap: 10px; }
-.item { padding: 13px; border: 1px solid #252d45; border-radius: 14px; background: rgba(255,255,255,.025); transition: transform .2s ease, border-color .2s ease, background-color .2s ease, box-shadow .2s ease; }
+.item {
+  padding: 13px;
+  border: 1px solid rgba(255,255,255,0.07);
+  border-radius: 16px;
+  background: rgba(255,255,255,0.025);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.03);
+  transition: transform .2s ease, border-color .2s ease, background-color .2s ease, box-shadow .2s ease;
+}
 .item:hover { transform: translateY(-1px); border-color: rgba(167,139,250,.32); }
 .content-view { animation: page-enter .32s cubic-bezier(.2,.75,.25,1) both; }
-.dashboard-stat-card, .note-card, .flashcard { transition: transform .2s ease, border-color .2s ease, box-shadow .2s ease, background-color .2s ease; }
+.dashboard-stat-card, .note-card, .flashcard {
+  transition: transform .2s ease, border-color .2s ease, box-shadow .2s ease, background-color .2s ease;
+  background: linear-gradient(180deg, rgba(20,24,38,0.72), rgba(12,15,25,0.72));
+}
 .dashboard-stat-card:hover, .note-card:hover, .flashcard:hover { transform: translateY(-3px); border-color: rgba(167,139,250,.48); box-shadow: 0 16px 36px rgba(0,0,0,.22); }
 .dashboard-stat-card:active, .note-card:active, .flashcard:active { transform: translateY(-1px) scale(.99); }
 
@@ -313,6 +486,23 @@ input:focus, select:focus, textarea:focus { border-color: #7c5cff; box-shadow: 0
 .hero p { max-width: 650px; margin: 18px auto 28px; color: #9ba5bd; font-size: 17px; line-height: 1.7; }
 .feature-row { display: flex; justify-content: center; flex-wrap: wrap; gap: 10px; margin: 20px 0 30px; }
 .pill { padding: 9px 12px; border: 1px solid #2a3150; border-radius: 99px; background: rgba(255,255,255,.035); color: #aab4cc; font-size: 12px; }
+.feature-strip {
+  overflow: hidden;
+  background: linear-gradient(180deg, rgba(17,20,31,0.7), rgba(12,15,25,0.8));
+  border: 1px solid rgba(255,255,255,0.08);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.04), 0 18px 42px rgba(0,0,0,.14);
+  backdrop-filter: blur(16px);
+}
+.feature-strip-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.feature-tile {
+  display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; padding: 14px 15px; border-radius: 18px;
+  border: 1px solid rgba(255,255,255,0.08); background: linear-gradient(180deg, rgba(255,255,255,0.025), rgba(255,255,255,0.012));
+  color: inherit; box-shadow: inset 0 1px 0 rgba(255,255,255,.04); transition: transform .2s ease, border-color .2s ease, background-color .2s ease, box-shadow .2s ease;
+}
+.feature-tile:hover { transform: translateY(-2px); border-color: rgba(167,139,250,.35); background: linear-gradient(180deg, rgba(167,139,250,.08), rgba(255,255,255,.02)); box-shadow: 0 14px 30px rgba(67,55,121,.2); }
+.feature-tile-icon { width: 42px; height: 42px; border-radius: 12px; display: grid; place-items: center; font-size: 20px; background: linear-gradient(135deg, rgba(124,92,255,.22), rgba(34,211,238,.12)); box-shadow: inset 0 1px 0 rgba(255,255,255,.08); }
+.feature-tile strong { display: block; font-size: 15px; margin-bottom: 2px; }
+.feature-tile small { display: block; color: #8a94ad; }
 
 .auth { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
 .auth-card { width: min(440px, 100%); }
@@ -389,12 +579,12 @@ input:focus, select:focus, textarea:focus { border-color: #7c5cff; box-shadow: 0
   .sidebar { display: none; }
   .mobile-nav { display: flex; position: fixed; bottom: 14px; left: 14px; right: 14px; z-index: 30; background: #101629eF; border: 1px solid #2b3450; border-radius: 16px; padding: 7px; justify-content: space-around; }
   .mobile-nav .nav-btn { justify-content: center; width: auto; }
-  .stats, .three { grid-template-columns: 1fr 1fr; }
+  .stats, .three, .feature-strip-grid { grid-template-columns: 1fr 1fr; }
   .content { padding: 20px; }
 }
 
 @media(max-width: 650px) {
-  .stats, .two, .three, .form-grid { grid-template-columns: 1fr; }
+  .stats, .two, .three, .form-grid, .feature-strip-grid { grid-template-columns: 1fr; }
   .topbar { padding: 0 14px; }
   .content { padding: 15px; }
   .title { font-size: 27px; }
@@ -1371,10 +1561,19 @@ input:focus, select:focus, textarea:focus {
 .note-subject { color:#c4b5fd; }
 .notes-status { min-height:20px; font-size:12px; }
 @media(max-width:800px) { .notes-layout { grid-template-columns:1fr; } .notes-list { max-height:430px; } }
-.dashboard-settings { display:grid; gap:12px; margin-bottom:16px; }
+.dashboard-settings {
+  display:grid; gap:12px; margin-bottom:16px;
+  background: linear-gradient(180deg, rgba(18,21,34,0.76), rgba(10,13,22,0.72));
+  border: 1px solid rgba(255,255,255,.07);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.04), 0 16px 42px rgba(0,0,0,.14);
+  backdrop-filter: blur(16px);
+}
 .dashboard-setting-group { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
 .dashboard-setting-label { width:100%; color:#9298aa; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; }
-.dashboard-setting-chip { display:inline-flex; align-items:center; gap:7px; padding:7px 10px; border:1px solid rgba(255,255,255,.09); border-radius:10px; background:rgba(255,255,255,.025); color:#c4c8d4; font-size:12px; }
+.dashboard-setting-chip {
+  display:inline-flex; align-items:center; gap:7px; padding:7px 10px; border:1px solid rgba(255,255,255,.09); border-radius:12px; background: rgba(255,255,255,.025);
+  color:#c4c8d4; font-size:12px; box-shadow: inset 0 1px 0 rgba(255,255,255,.03);
+}
 .dashboard-stat-card { width:100%; color:inherit; cursor:pointer; text-align:left; }
 .dashboard-stat-card:focus-visible, .schedule-drop:focus-visible, .flashcard:focus-visible { outline:2px solid #a78bfa; outline-offset:3px; }
 .dashboard-task { display:flex; align-items:center; gap:11px; }
@@ -1488,6 +1687,143 @@ body { font-size: 15px; line-height: 1.6; }
     transition-duration: .01ms;
     animation-duration: .01ms;
   }
+}
+
+/* ---------- Premium polish (additive) ---------- */
+.pw-field { position: relative; }
+.pw-field input { padding-right: 76px; }
+.pw-toggle { position: absolute; top: 50%; right: 6px; transform: translateY(-50%); min-width: 64px; height: 36px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 0 10px; border: 0; border-radius: 10px; background: rgba(148, 163, 184, 0.12); color: #c7d2fe; transition: color .18s ease, background-color .18s ease, transform .18s ease; }
+.pw-toggle:hover:not(:disabled) { color: var(--theme-primary, #a78bfa); background: rgba(var(--theme-rgb, 167, 139, 250), .12); }
+.pw-toggle:focus-visible, .chip-btn:focus-visible { outline: 2px solid var(--theme-primary, #a78bfa); outline-offset: 2px; }
+.pw-toggle-text { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; font-weight: 700; }
+.pw-hint { margin-top: 6px; font-size: 12.5px; color: #f5c26b; }
+.pw-meter { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; margin-top: 9px; }
+.pw-meter span { height: 4px; border-radius: 99px; background: rgba(255,255,255,.09); transition: background-color .25s ease; }
+.pw-meter span.on.s1 { background: #fb7185; }
+.pw-meter span.on.s2 { background: #fbbf24; }
+.pw-meter span.on.s3 { background: #67e8d2; }
+.pw-meter span.on.s4 { background: #34d399; }
+.pw-meter-label { margin-top: 6px; font-size: 12.5px; color: #8f9ab2; }
+.attempts { display: flex; align-items: center; gap: 10px; font-size: 13px; color: #b7bbca; line-height: 1.5; }
+.attempt-dots { display: flex; gap: 5px; flex-shrink: 0; }
+.attempt-dots i { width: 9px; height: 9px; border-radius: 50%; background: rgba(255,255,255,.14); }
+.attempt-dots i.used { background: #fb7185; box-shadow: 0 0 9px rgba(251,113,133,.6); }
+.lock-banner { border: 1px solid rgba(251,113,133,.35); background: rgba(251,113,133,.08); color: #ffb3bf; padding: 12px 14px; border-radius: 12px; font-size: 13.5px; line-height: 1.6; }
+.lock-banner b { font-variant-numeric: tabular-nums; font-size: 15px; }
+
+.focus-panel {
+  display: grid; grid-template-columns: auto minmax(0, 1.25fr) minmax(0, 1fr); gap: clamp(18px, 3vw, 36px); align-items: center; margin-bottom: 16px; position: relative; overflow: hidden;
+  background:
+    linear-gradient(135deg, rgba(18,21,33,0.9), rgba(10,13,22,0.76) 42%, rgba(13,17,28,0.86)),
+    radial-gradient(circle at 18% 18%, rgba(var(--theme-rgb, 167, 139, 250), 0.18), transparent 33%),
+    radial-gradient(circle at 78% 100%, rgba(34,211,238,0.12), transparent 30%);
+  border: 1px solid rgba(255,255,255,0.08);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.06), 0 20px 50px rgba(0,0,0,.18), 0 0 0 1px rgba(var(--theme-rgb, 167, 139, 250), .04);
+  backdrop-filter: blur(16px);
+}
+.focus-panel::before {
+  content: ""; position: absolute; inset: auto 18px 18px auto; width: 170px; height: 170px; border-radius: 50%;
+  background: radial-gradient(circle, rgba(var(--theme-rgb, 167, 139, 250), .17), transparent 70%);
+  filter: blur(18px); pointer-events: none;
+}
+.focus-panel::after { content: ""; position: absolute; inset: 0 0 auto 0; height: 1px; background: linear-gradient(90deg, transparent, rgba(var(--theme-rgb, 167, 139, 250), .75), transparent); pointer-events: none; }
+.focus-ring {
+  width: 138px; height: 138px; border-radius: 50%; display: grid; place-items: center; background: conic-gradient(var(--theme-primary, #a78bfa) 0 var(--goal, 0%), rgba(255,255,255,.08) var(--goal, 0%) 100%);
+  box-shadow: 0 0 0 8px rgba(var(--theme-rgb, 167, 139, 250), .05), 0 0 40px rgba(var(--theme-rgb, 167, 139, 250), .18), inset 0 1px 0 rgba(255,255,255,.18);
+  flex-shrink: 0; position: relative; isolation: isolate;
+}
+.focus-ring::before {
+  content: ""; position: absolute; inset: -8px; border-radius: 50%; border: 1px solid rgba(var(--theme-rgb, 167, 139, 250), .18); background: transparent;
+}
+.focus-ring-inner {
+  width: 112px; height: 112px; border-radius: 50%; background: linear-gradient(180deg, rgba(17,20,32,0.96), rgba(8,11,18,0.96)); display: grid; place-content: center; text-align: center; gap: 2px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.05);
+}
+.sf-app.light .focus-ring-inner { background: linear-gradient(180deg, #ffffff, #f6f8ff); }
+.focus-ring-inner b { font: 800 28px "Manrope", sans-serif; letter-spacing: -.04em; color: var(--theme-primary, #c4b5fd); }
+.focus-ring-inner span { font-size: 12px; color: #8f9ab2; }
+.focus-main {
+  display: flex; flex-direction: column; justify-content: center; min-width: 0; padding-right: 6px;
+}
+.focus-main .card-title {
+  margin-bottom: 4px; font-size: 1.05rem;
+}
+.focus-main h2.card-title { font-size: clamp(1.35rem, 2vw, 2rem); letter-spacing: -.04em; }
+.focus-main p { max-width: 48ch; margin: 0; }
+.focus-chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0 10px; }
+.chip-btn {
+  border: 1px solid rgba(var(--theme-rgb, 167, 139, 250), .28);
+  background: rgba(var(--theme-rgb, 167, 139, 250), .08); color: inherit; padding: 7px 14px; border-radius: 99px; font-weight: 600; font-size: 13px;
+  transition: background-color .18s ease, border-color .18s ease, transform .18s ease, box-shadow .18s ease;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.04);
+}
+.chip-btn:hover:not(:disabled) { background: rgba(var(--theme-rgb, 167, 139, 250), .18); border-color: rgba(var(--theme-rgb, 167, 139, 250), .55); box-shadow: 0 0 0 1px rgba(var(--theme-rgb, 167, 139, 250), .12); }
+.chip-btn:active { transform: scale(.97); }
+.chip-btn.active {
+  background: linear-gradient(135deg, rgba(var(--theme-rgb, 167, 139, 250), .28), rgba(var(--theme-rgb, 167, 139, 250), .14)); border-color: rgba(var(--theme-rgb, 167, 139, 250), .68);
+  box-shadow: 0 0 18px rgba(var(--theme-rgb, 167, 139, 250), .1);
+}
+.focus-meta {
+  display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 13.5px; color: #a8b0c4;
+}
+.focus-meta span {
+  display: inline-flex; align-items: center; gap: 6px; padding: 7px 10px; border-radius: 999px; background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.05);
+}
+.focus-meta b { color: #eef2ff; }
+.sf-app.light .focus-meta b { color: #172033; }
+.focus-week {
+  display: flex; flex-direction: column; justify-content: center; min-width: 0; padding-left: 10px; border-left: 1px solid rgba(255,255,255,.08);
+  background: linear-gradient(90deg, rgba(255,255,255,.015), rgba(255,255,255,0));
+}
+.focus-week-head { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; color: #8f9ab2; margin-bottom: 6px; }
+.focus-week-head b { color: var(--theme-primary, #c4b5fd); font-weight: 700; }
+
+.wb { width: 100%; padding-top: 18px; }
+.wb-plot { position: relative; display: flex; align-items: flex-end; gap: 8px; height: 72px; border-bottom: 1px solid rgba(255,255,255,.1); }
+.wb.tall .wb-plot { height: 170px; gap: 14px; }
+.wb-col { flex: 1; height: 100%; display: flex; align-items: flex-end; }
+.wb-col i { display: block; width: 100%; min-height: 3px; border-radius: 7px 7px 2px 2px; background: rgba(var(--theme-rgb, 167, 139, 250), .38); transition: height .5s ease; }
+.wb-col i.empty { background: rgba(255,255,255,.08); }
+.wb-col i.met { background: linear-gradient(180deg, var(--theme-secondary, #67e8d2), var(--theme-primary, #a78bfa)); box-shadow: 0 0 14px rgba(var(--theme-rgb, 167, 139, 250), .35); }
+.wb-col i.today { outline: 1px solid rgba(var(--theme-rgb, 167, 139, 250), .9); outline-offset: 2px; }
+.wb-goal { position: absolute; left: 0; right: 0; border-top: 1px dashed rgba(var(--theme-rgb, 167, 139, 250), .55); pointer-events: none; z-index: 1; }
+.wb-goal em { position: absolute; right: 0; top: -17px; font-size: 10.5px; font-style: normal; color: var(--theme-primary, #a78bfa); }
+.wb-labels { display: flex; gap: 8px; margin-top: 8px; }
+.wb.tall .wb-labels { gap: 14px; }
+.wb-label { flex: 1; text-align: center; display: grid; gap: 2px; }
+.wb-label small { font-size: 11px; color: #7e899f; }
+.wb-label small.is-today { color: var(--theme-primary, #a78bfa); font-weight: 700; }
+.wb-label strong { font-size: 12.5px; font-weight: 700; }
+
+.week-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 6px 0 12px; }
+.week-stat { padding: 14px 16px; border-radius: 14px; border: 1px solid rgba(255,255,255,.07); background: rgba(255,255,255,.025); }
+.week-stat span { display: block; font-size: 12.5px; color: #8f9ab2; }
+.week-stat b { display: block; margin-top: 4px; font: 700 20px "Manrope", sans-serif; letter-spacing: -.03em; }
+.sf-app.light .week-stat { border-color: #e2e6f3; background: #fff; }
+.goal-setter { margin-top: 18px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,.07); }
+.inline-form { display: flex; gap: 8px; }
+.inline-form input { flex: 1; min-width: 0; }
+
+.sf-app .primary-btn { position: relative; overflow: hidden; }
+.sf-app .primary-btn::after { content: ""; position: absolute; inset: 0; background: linear-gradient(105deg, transparent 35%, rgba(255,255,255,.18) 50%, transparent 65%); transform: translateX(-120%); transition: transform .6s ease; pointer-events: none; }
+.sf-app .primary-btn:hover:not(:disabled)::after { transform: translateX(120%); }
+.primary-btn:focus-visible, .ghost-btn:focus-visible { outline: 2px solid var(--theme-primary, #a78bfa); outline-offset: 2px; }
+.sf-app *::-webkit-scrollbar, .auth *::-webkit-scrollbar { width: 10px; height: 10px; }
+.sf-app *::-webkit-scrollbar-thumb { background: rgba(var(--theme-rgb, 167, 139, 250), .25); border-radius: 99px; }
+.sf-app ::selection, .auth ::selection { background: rgba(var(--theme-rgb, 167, 139, 250), .35); }
+
+@media (max-width: 960px) {
+  .focus-panel { grid-template-columns: auto minmax(0, 1fr); }
+  .focus-week { grid-column: 1 / -1; }
+}
+@media (max-width: 640px) {
+  .focus-panel { grid-template-columns: 1fr; justify-items: center; text-align: center; }
+  .focus-panel .focus-chips, .focus-panel .focus-meta { justify-content: center; }
+  .focus-week { width: 100%; }
+  .week-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .wb-col i, .chip-btn, .pw-toggle, .sf-app .primary-btn::after { transition-duration: .01ms; }
 }
 `;
 
@@ -1829,7 +2165,82 @@ function Welcome({ onLogin, onRegister, theme, setTheme }) {
   );
 }
 
-function AuthScreen({ mode, busy, error, onSubmit, onRecover, onToggleMode, onBack, theme, setTheme }) {
+function EyeIcon({ off }) {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      {off ? (
+        <>
+          <path d="M3 3l18 18" />
+          <path d="M10.6 5.1A10.6 10.6 0 0 1 12 5c5.5 0 9 5.2 10 7-.5.9-1.6 2.5-3.2 3.9M6.6 6.6C4.4 8 2.9 10.2 2 12c1 1.8 4.5 7 10 7 1.6 0 3-.4 4.3-1" />
+          <path d="M9.9 9.9a3 3 0 0 0 4.2 4.2" />
+        </>
+      ) : (
+        <>
+          <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z" />
+          <circle cx="12" cy="12" r="3" />
+        </>
+      )}
+    </svg>
+  );
+}
+
+function PasswordField({ label, value, onChange, placeholder, autoComplete, minLength, disabled, showStrength }) {
+  const [visible, setVisible] = useState(false);
+  const [capsOn, setCapsOn] = useState(false);
+  const strength = showStrength ? getPasswordStrength(value) : null;
+  const trackCaps = (event) => {
+    if (event.getModifierState) setCapsOn(event.getModifierState("CapsLock"));
+  };
+
+  return (
+    <label>
+      <div className="muted">{label}</div>
+      <div className="pw-field">
+        <input
+          type={visible ? "text" : "password"}
+          value={value}
+          onChange={onChange}
+          onKeyDown={trackCaps}
+          onKeyUp={trackCaps}
+          onBlur={() => setCapsOn(false)}
+          placeholder={placeholder}
+          autoComplete={autoComplete}
+          minLength={minLength}
+          maxLength={128}
+          disabled={disabled}
+          spellCheck={false}
+          required
+        />
+        <button
+          type="button"
+          className="pw-toggle"
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => setVisible((current) => !current)}
+          aria-label={visible ? "Hide password" : "Show password"}
+          aria-pressed={visible}
+          title={visible ? "Hide password" : "Show password"}
+          disabled={disabled}
+        >
+          <EyeIcon off={visible} />
+          <span className="pw-toggle-text">{visible ? "Hide" : "Show"}</span>
+        </button>
+      </div>
+      {capsOn && <div className="pw-hint" role="status">Caps Lock is on.</div>}
+      {strength && value && (
+        <>
+          <div className="pw-meter" aria-hidden="true">
+            {[1, 2, 3, 4].map((step) => (
+              <span key={step} className={step <= strength.score ? `on s${strength.score}` : ""} />
+            ))}
+          </div>
+          <div className="pw-meter-label">Password strength: {strength.label}</div>
+        </>
+      )}
+    </label>
+  );
+}
+
+function AuthScreen({ mode, busy, error, onSubmit, onRecover, onToggleMode, onBack, theme, setTheme, loginGuard, onLockExpired }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
@@ -1838,10 +2249,31 @@ function AuthScreen({ mode, busy, error, onSubmit, onRecover, onToggleMode, onBa
   const [recoveryCode, setRecoveryCode] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [recovering, setRecovering] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
   const isRegistering = mode === "register";
+  const isLogin = !isRegistering && !recovering;
+  const lockedUntil = loginGuard?.lockedUntil || 0;
+  const locked = isLogin && lockedUntil > now;
+  const failed = loginGuard?.failed || 0;
+  const attemptsLeft = Math.max(0, MAX_LOGIN_ATTEMPTS - failed);
+  const secondsLeft = Math.max(0, Math.ceil((lockedUntil - now) / 1000));
+  const countdown = `${Math.floor(secondsLeft / 60)}:${String(secondsLeft % 60).padStart(2, "0")}`;
+
+  useEffect(() => {
+    if (!lockedUntil) return undefined;
+    const tick = () => {
+      const current = Date.now();
+      setNow(current);
+      if (current >= lockedUntil) onLockExpired();
+    };
+    tick();
+    const intervalId = window.setInterval(tick, 1000);
+    return () => window.clearInterval(intervalId);
+  }, [lockedUntil, onLockExpired]);
 
   const submit = (event) => {
     event.preventDefault();
+    if (locked) return;
     if (recovering) onRecover({ email, recoveryCode, newPassword });
     else onSubmit({ email, password, name, studentClass, course });
   };
@@ -1892,28 +2324,47 @@ function AuthScreen({ mode, busy, error, onSubmit, onRecover, onToggleMode, onBa
                 <div className="muted">Recovery code</div>
                 <input value={recoveryCode} onChange={(event) => setRecoveryCode(event.target.value)} placeholder="Paste your recovery code" autoComplete="off" required />
               </label>
-              <label>
-                <div className="muted">New password</div>
-                <input type="password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} placeholder="At least 12 characters" autoComplete="new-password" minLength={12} maxLength={128} required />
-              </label>
+              <PasswordField
+                label="New password"
+                value={newPassword}
+                onChange={(event) => setNewPassword(event.target.value)}
+                placeholder="At least 12 characters"
+                autoComplete="new-password"
+                minLength={12}
+                showStrength
+              />
             </>
           ) : (
-            <label>
-              <div className="muted">Password</div>
-              <input
-                type="password"
-                value={password}
-                onChange={(event) => setPassword(event.target.value)}
-                placeholder={isRegistering ? "At least 12 characters" : "Enter your password"}
-                autoComplete={isRegistering ? "new-password" : "current-password"}
-                minLength={isRegistering ? 12 : undefined}
-                maxLength={128}
-                required
-              />
-            </label>
+            <PasswordField
+              label="Password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              placeholder={isRegistering ? "At least 12 characters" : "Enter your password"}
+              autoComplete={isRegistering ? "new-password" : "current-password"}
+              minLength={isRegistering ? 12 : undefined}
+              disabled={locked}
+              showStrength={isRegistering}
+            />
           )}
           {error && <div className="auth-error" role="alert">{error}</div>}
-          <button className="primary-btn" disabled={busy}>{busy ? "Please wait…" : recovering ? "Reset password →" : isRegistering ? "Create account →" : "Log in →"}</button>
+          {isLogin && !locked && failed > 0 && (
+            <div className="attempts" role="status">
+              <span className="attempt-dots" aria-hidden="true">
+                {Array.from({ length: MAX_LOGIN_ATTEMPTS }, (_, index) => (
+                  <i key={index} className={index < failed ? "used" : ""} />
+                ))}
+              </span>
+              {attemptsLeft} {attemptsLeft === 1 ? "attempt" : "attempts"} left before login pauses for 5 minutes.
+            </div>
+          )}
+          {locked && (
+            <div className="lock-banner" role="alert">
+              Too many incorrect passwords. Login is paused for <b>{countdown}</b>. If you forgot it, use Forgot password with your recovery code.
+            </div>
+          )}
+          <button className="primary-btn" disabled={busy || locked}>
+            {locked ? `Try again in ${countdown}` : busy ? "Please wait…" : recovering ? "Reset password →" : isRegistering ? "Create account →" : "Log in →"}
+          </button>
         </form>
         {!recovering && !isRegistering && <button className="auth-switch" type="button" onClick={() => setRecovering(true)} style={{ display: "block", margin: "16px auto" }}>Forgot password?</button>}
         {recovering && <button className="auth-switch" type="button" onClick={() => setRecovering(false)} style={{ display: "block", margin: "16px auto" }}>Back to log in</button>}
@@ -1971,6 +2422,33 @@ function StudentSetup({ profile, onContinue, theme }) {
    DASHBOARD
 ----------------------------------------------------------- */
 
+function WeekBars({ data, goal, tall }) {
+  const max = Math.max(goal, ...data.map((day) => day.total), 1);
+  return (
+    <div className={"wb" + (tall ? " tall" : "")} role="img" aria-label={`Study minutes for the last 7 days against a ${goal} minute goal`}>
+      <div className="wb-plot">
+        <span className="wb-goal" style={{ bottom: `${(goal / max) * 100}%` }}><em>{goal} min goal</em></span>
+        {data.map((day) => (
+          <div className="wb-col" key={day.key} title={`${day.label}: ${day.total} min`}>
+            <i
+              className={(day.total === 0 ? "empty " : "") + (day.total >= goal ? "met " : "") + (day.isToday ? "today" : "")}
+              style={{ height: day.total ? `${Math.max(6, (day.total / max) * 100)}%` : undefined }}
+            />
+          </div>
+        ))}
+      </div>
+      <div className="wb-labels">
+        {data.map((day) => (
+          <span className="wb-label" key={day.key}>
+            <small className={day.isToday ? "is-today" : ""}>{day.isToday ? "Today" : day.label}</small>
+            {tall && <strong>{day.total}</strong>}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function Dashboard({
   profile,
   navigate,
@@ -1982,11 +2460,15 @@ function Dashboard({
   notify,
   preferences,
   setPreferences,
+  onRecordStudy,
+  onExport,
+  onImport,
 }) {
   const [timeGreeting, setTimeGreeting] = useState(getIndiaTimeGreeting);
   const [quoteIndex, setQuoteIndex] = useState(() => new Date().getDate() % motivationalQuotes.length);
   const completed = tasks.filter((task) => task.done).length;
   const pending = tasks.filter((task) => !task.done).length;
+  const recentSessionTypes = ["Focus", "Revision", "Reading", "Practice", "Deep work"];
 
   useEffect(() => {
     const updateGreeting = () => setTimeGreeting(getIndiaTimeGreeting());
@@ -1994,12 +2476,28 @@ function Dashboard({
     return () => window.clearInterval(intervalId);
   }, []);
 
-  const todayMinutes = studySessions
-    .filter((session) => session.date === getTodayKey())
-    .reduce((sum, session) => sum + session.minutes, 0);
+  const todayMinutes = getMinutesForDate(studySessions, getTodayKey());
 
   const goal = Number(profile.dailyGoal) || 60;
   const goalPercent = Math.min(100, Math.round((todayMinutes / goal) * 100));
+  const remaining = Math.max(0, goal - todayMinutes);
+  const streak = getEffectiveStreak(profile);
+  const weekData = useMemo(() => getWeekData(studySessions), [studySessions]);
+  const weekTotal = weekData.reduce((sum, day) => sum + day.total, 0);
+  const dueToday = tasks.filter((task) => !task.done && task.due && isToday(task.due)).length;
+  const overdue = tasks.filter((task) => !task.done && task.due && isPast(task.due)).length;
+
+  const quickLog = (amount, type = "Focus") => {
+    onRecordStudy(amount, type);
+    notify(todayMinutes < goal && todayMinutes + amount >= goal ? "Daily goal reached 🎉" : `${amount} minutes recorded 🔥`);
+  };
+
+  const quickActions = [
+    { icon: "⏱️", label: "Focus timer", meta: "Start a sprint", action: () => navigate("pomodoro") },
+    { icon: "✓", label: "Add task", meta: "Plan your day", action: () => navigate("tasks") },
+    { icon: "📚", label: "Subjects", meta: "Track modules", action: () => navigate("subjects") },
+    { icon: "▤", label: "Daily review", meta: "Quick recap", action: () => navigate("flashcards") },
+  ];
 
   const upcomingTasks = tasks
     .filter((task) => !task.done && task.due)
@@ -2009,12 +2507,22 @@ function Dashboard({
   const upcomingExams = [...exams]
     .sort((a, b) => a.date.localeCompare(b.date))
     .slice(0, 3);
+  const examAlerts = upcomingExams.filter((exam) => {
+    const days = daysUntil(exam.date);
+    return days >= 0 && days <= 7;
+  });
+  const dashboardAlerts = [
+    overdue > 0 ? `${overdue} task${overdue === 1 ? "" : "s"} overdue` : "",
+    dueToday > 0 ? `${dueToday} task${dueToday === 1 ? " is" : "s are"} due today` : "",
+    examAlerts.length > 0 ? `${examAlerts.length} exam${examAlerts.length === 1 ? "" : "s"} within 7 days` : "",
+    goalPercent < 100 && todayMinutes === 0 ? "No study session logged today" : "",
+  ].filter(Boolean);
   const statCards = {
     streak: {
       icon: "🔥",
       label: "Study streak",
-      value: `${profile.streak} days`,
-      detail: "Keep your momentum",
+      value: `${streak} days`,
+      detail: streak ? "Keep your momentum" : "Study today to start one",
       page: "progress",
     },
     today: {
@@ -2080,6 +2588,8 @@ function Dashboard({
           <div className="muted">{profile.course ? profile.course : "Your personalized study workspace"}</div>
         </div>
         <div className="actions">
+          <button className="ghost-btn" onClick={onExport}>↓ Export data</button>
+          <label className="ghost-btn" style={{ cursor: "pointer" }}>↑ Import data<input type="file" accept="application/json" onChange={onImport} style={{ display: "none" }} /></label>
           <button className="ghost-btn" onClick={() => navigate("flashcards")}>▤ Daily review</button>
           <button className="ghost-btn" onClick={() => navigate("schedule")}>◷ Plan week</button>
           <button className="ghost-btn" onClick={() => navigate("subjects")}>+ Subject</button>
@@ -2102,6 +2612,42 @@ function Dashboard({
           <span className="hide-mobile">Another thought</span>
           <span aria-hidden="true"> ↗</span>
         </button>
+      </section>
+
+      <section className="panel" aria-label="Study alerts">
+        <div className="row" style={{ marginBottom: 12 }}>
+          <div>
+            <div className="eyebrow">Needs attention</div>
+            <h2 className="card-title" style={{ margin: 0 }}>Today’s alerts</h2>
+          </div>
+          <span className={`tag ${dashboardAlerts.length ? "high" : ""}`}>{dashboardAlerts.length ? `${dashboardAlerts.length} active` : "All clear"}</span>
+        </div>
+        {dashboardAlerts.length ? (
+          <div className="alert-list">
+            {dashboardAlerts.map((alert) => <div className="item" key={alert}>⚠ <b>{alert}</b></div>)}
+          </div>
+        ) : <div className="muted">Your tasks, exams, and study goal are on track.</div>}
+      </section>
+
+      <section className="panel feature-strip">
+        <div className="row" style={{ marginBottom: 16 }}>
+          <div>
+            <div className="eyebrow">Quick workflow</div>
+            <h2 className="card-title" style={{ margin: 0 }}>Start your next move</h2>
+          </div>
+          <button className="ghost-btn" onClick={() => navigate("progress")}>Open analytics →</button>
+        </div>
+        <div className="feature-strip-grid">
+          {quickActions.map((item) => (
+            <button key={item.label} type="button" className="feature-tile" onClick={item.action}>
+              <span className="feature-tile-icon">{item.icon}</span>
+              <span>
+                <strong>{item.label}</strong>
+                <small>{item.meta}</small>
+              </span>
+            </button>
+          ))}
+        </div>
       </section>
 
       <details className="panel dashboard-settings">
@@ -2262,6 +2808,62 @@ function Dashboard({
           )}
         </div>
       )}
+
+      <section className="panel focus-panel" aria-label="Daily goal" style={{ marginTop: 16 }}>
+        <div className="row" style={{ marginBottom: 14 }}>
+          <div>
+            <div className="eyebrow">Today’s priority</div>
+            <h2 className="card-title" style={{ margin: 0 }}>Focus overview</h2>
+          </div>
+          <span className="tag">{goalPercent >= 100 ? "Goal done" : "On track"}</span>
+        </div>
+        <div
+          className="focus-ring"
+          style={{ "--goal": goalPercent + "%" }}
+          role="progressbar"
+          aria-label="Daily study goal progress"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={goalPercent}
+        >
+          <div className="focus-ring-inner">
+            <b>{goalPercent}%</b>
+            <span>{todayMinutes}/{goal} min</span>
+          </div>
+        </div>
+        <div className="focus-main">
+          <h2 className="card-title" style={{ margin: 0 }}>
+            {goalPercent >= 100 ? "Daily goal complete" : `${remaining} min to reach today's goal`}
+          </h2>
+          <p className="muted" style={{ margin: "6px 0 0" }}>
+            {goalPercent >= 100
+              ? "Anything extra today is a bonus."
+              : todayMinutes === 0
+                ? "Log a session or start the focus timer to get moving."
+                : "Good progress. One more session gets you there."}
+          </p>
+          <div className="focus-chips">
+            {[15, 25, 45].map((amount) => (
+              <button key={amount} type="button" className="chip-btn" onClick={() => quickLog(amount, "Focus")}>+{amount} min</button>
+            ))}
+            <button type="button" className="chip-btn active" onClick={() => navigate("pomodoro")}>Start focus timer</button>
+          </div>
+          <div className="row" style={{ marginTop: 10, gap: 8, flexWrap: "wrap" }}>
+            {recentSessionTypes.map((type) => (
+              <button key={type} type="button" className="chip-btn" onClick={() => quickLog(20, type)}>{type}</button>
+            ))}
+          </div>
+          <div className="focus-meta">
+            <span>🔥 <b>{streak}</b> day streak</span>
+            <span>✓ <b>{dueToday}</b> due today</span>
+            {overdue > 0 && <span style={{ color: "#fb7185" }}>⚠ <b style={{ color: "inherit" }}>{overdue}</b> overdue</span>}
+          </div>
+        </div>
+        <div className="focus-week">
+          <div className="focus-week-head"><span>Last 7 days</span><b>{weekTotal} min total</b></div>
+          <WeekBars data={weekData} goal={goal} />
+        </div>
+      </section>
     </>
   );
 }
@@ -2660,71 +3262,67 @@ function Tasks({ tasks, setTasks, subjects, notify }) {
    PROGRESS
 ----------------------------------------------------------- */
 
-function Progress({ profile, setProfile, tasks, subjects, studySessions, notify }) {
+function Progress({ profile, setProfile, tasks, subjects, studySessions, notify, onRecordStudy }) {
   const [minutes, setMinutes] = useState("");
+  const [customGoal, setCustomGoal] = useState("");
+  const [sessionType, setSessionType] = useState("Focus");
   const today = getTodayKey();
 
-  const todayMinutes = studySessions
-    .filter((session) => session.date === today)
-    .reduce((sum, session) => sum + session.minutes, 0);
-
+  const todayMinutes = getMinutesForDate(studySessions, today);
   const goal = Number(profile.dailyGoal) || 60;
   const goalPercent = Math.min(100, Math.round((todayMinutes / goal) * 100));
+  const remaining = Math.max(0, goal - todayMinutes);
   const completed = tasks.filter((task) => task.done).length;
   const completionPercent = tasks.length ? Math.round((completed / tasks.length) * 100) : 0;
+  const overdue = tasks.filter((task) => !task.done && task.due && isPast(task.due)).length;
 
-  const addStudyTime = (e) => {
-    e.preventDefault();
-    const value = Number(minutes);
-    if (!value || value <= 0) {
+  const streak = getEffectiveStreak(profile);
+  const bestStreak = Math.max(Number(profile.bestStreak) || 0, streak);
+  const nextMilestone = getNextMilestone(streak);
+  const studiedToday = profile.lastStudyDate === today;
+
+  const weekData = useMemo(() => getWeekData(studySessions), [studySessions]);
+  const weekTotal = weekData.reduce((sum, day) => sum + day.total, 0);
+  const weekAverage = Math.round(weekTotal / 7);
+  const bestDay = weekData.reduce((best, day) => (day.total > best.total ? day : best), weekData[0]);
+  const goalDays = weekData.filter((day) => day.total >= goal).length;
+
+  const recordMinutes = (raw) => {
+    const value = Math.round(Number(raw));
+    if (!Number.isFinite(value) || value <= 0) {
       notify("Enter valid study minutes");
-      return;
+      return false;
     }
-
-    setProfile((p) => {
-      const currentDate = getTodayKey();
-      let newStreak = Number(p.streak) || 0;
-
-      if (p.lastStudyDate !== currentDate) {
-        const yesterday = new Date();
-        yesterday.setDate(yesterday.getDate() - 1);
-        const yesterdayKey = yesterday.toISOString().slice(0, 10);
-        if (p.lastStudyDate === yesterdayKey) {
-          newStreak += 1;
-        } else {
-          newStreak = 1;
-        }
-      }
-
-      return {
-        ...p,
-        streak: newStreak,
-        lastStudyDate: currentDate,
-      };
-    });
-
-    setMinutes("");
-    notify(`${value} minutes recorded 🔥`);
+    if (value > 720) {
+      notify("A single entry can be up to 720 minutes");
+      return false;
+    }
+    const nextTotal = todayMinutes + value;
+    onRecordStudy(value, sessionType);
+    notify(nextTotal >= goal ? `Daily goal reached with ${sessionType.toLowerCase()} study 🎉` : `${value} minutes recorded in ${sessionType.toLowerCase()} mode 🔥`);
+    return true;
   };
 
-  const weekData = useMemo(() => {
-    const result = [];
-    for (let i = 6; i >= 0; i--) {
-      const date = new Date();
-      date.setDate(date.getDate() - i);
-      const key = date.toISOString().slice(0, 10);
-      const total = studySessions
-        .filter((session) => session.date === key)
-        .reduce((sum, session) => sum + session.minutes, 0);
+  const addStudyTime = (event) => {
+    event.preventDefault();
+    if (recordMinutes(minutes)) setMinutes("");
+  };
 
-      result.push({
-        key,
-        label: date.toLocaleDateString(undefined, { weekday: "short" }),
-        total,
-      });
+  const setGoal = (value) => {
+    const next = Math.round(Number(value));
+    if (!Number.isFinite(next) || next < 10 || next > 720) {
+      notify("Choose a goal between 10 and 720 minutes");
+      return;
     }
-    return result;
-  }, [studySessions]);
+    setProfile((current) => ({ ...current, dailyGoal: next }));
+    notify(`Daily goal set to ${next} minutes`);
+  };
+
+  const submitCustomGoal = (event) => {
+    event.preventDefault();
+    setGoal(customGoal);
+    setCustomGoal("");
+  };
 
   return (
     <>
@@ -2747,28 +3345,72 @@ function Progress({ profile, setProfile, tasks, subjects, studySessions, notify 
               </div>
             </div>
           </div>
+          <p className="muted" style={{ textAlign: "center", margin: "0 0 14px" }}>
+            {goalPercent >= 100 ? "Goal complete. Extra time is a bonus." : `${remaining} min left to reach your goal.`}
+          </p>
+          <div className="focus-chips" style={{ justifyContent: "center", margin: "0 0 12px" }}>
+            {[15, 25, 45].map((amount) => (
+              <button key={amount} type="button" className="chip-btn" onClick={() => recordMinutes(amount)}>+{amount}</button>
+            ))}
+          </div>
           <form className="list" onSubmit={addStudyTime}>
-            <input
-              type="number"
-              min="1"
-              value={minutes}
-              onChange={(e) => setMinutes(e.target.value)}
-              placeholder="Add study minutes"
-            />
+            <div className="row" style={{ gap: 8, alignItems: "stretch", flexWrap: "wrap" }}>
+              <input
+                type="number"
+                min="1"
+                max="720"
+                value={minutes}
+                onChange={(e) => setMinutes(e.target.value)}
+                placeholder="Add study minutes"
+                aria-label="Study minutes to record"
+                style={{ flex: 1, minWidth: 140 }}
+              />
+              <select value={sessionType} onChange={(e) => setSessionType(e.target.value)} style={{ maxWidth: 180 }}>
+                <option>Focus</option>
+                <option>Revision</option>
+                <option>Reading</option>
+                <option>Practice</option>
+                <option>Deep work</option>
+              </select>
+            </div>
             <button className="primary-btn">Record Study Time</button>
           </form>
+          <div className="goal-setter">
+            <div className="muted" style={{ fontSize: 13 }}>Daily goal</div>
+            <div className="focus-chips" style={{ margin: "8px 0" }}>
+              {[30, 60, 90, 120].map((value) => (
+                <button key={value} type="button" className={"chip-btn" + (goal === value ? " active" : "")} onClick={() => setGoal(value)}>{value}m</button>
+              ))}
+            </div>
+            <form className="inline-form" onSubmit={submitCustomGoal}>
+              <input type="number" min="10" max="720" value={customGoal} onChange={(e) => setCustomGoal(e.target.value)} placeholder="Custom minutes" aria-label="Custom daily goal in minutes" />
+              <button className="ghost-btn" type="submit">Set</button>
+            </form>
+          </div>
         </div>
 
         <div className="panel">
           <h2 className="card-title">🔥 Study Streak</h2>
           <div style={{ font: '800 55px "Manrope"', textAlign: "center", marginTop: 25 }}>
-            {profile.streak}
+            {streak}
           </div>
           <p className="muted" style={{ textAlign: "center" }}>consecutive study days</p>
           <div className="ai-suggestion">
-            {profile.streak >= 7
-              ? "Amazing consistency! Keep protecting your study habit."
-              : "Study today to build your streak."}
+            {studiedToday
+              ? "Today is counted. Come back tomorrow to keep it going."
+              : streak > 0
+                ? `Study today to keep your ${streak}-day streak alive.`
+                : "Record a session to start a new streak."}
+          </div>
+          <div style={{ marginTop: 18 }}>
+            <div className="row" style={{ fontSize: 13 }}>
+              <span className="muted">Next milestone</span>
+              <b>{streak}/{nextMilestone} days</b>
+            </div>
+            <div className="progress" style={{ marginTop: 8 }}>
+              <div className="bar" style={{ width: `${Math.min(100, (streak / nextMilestone) * 100)}%` }} />
+            </div>
+            <p className="muted" style={{ fontSize: 13, marginBottom: 0 }}>Longest streak: {bestStreak} {bestStreak === 1 ? "day" : "days"}</p>
           </div>
         </div>
 
@@ -2779,24 +3421,47 @@ function Progress({ profile, setProfile, tasks, subjects, studySessions, notify 
             <div className="bar" style={{ width: completionPercent + "%" }} />
           </div>
           <p className="muted">{completed} completed out of {tasks.length} tasks.</p>
+          {overdue > 0 && <div className="lock-banner" style={{ marginTop: 12 }}>{overdue} overdue {overdue === 1 ? "task needs" : "tasks need"} attention.</div>}
+        </div>
+      </div>
+
+      <div className="panel" style={{ marginTop: 16 }}>
+        <div className="row">
+          <h2 className="card-title">Session health</h2>
+          <span className="tag">{studySessions.filter((session) => session.date === today).length} entries today</span>
+        </div>
+        <div className="week-stats">
+          <div className="week-stat"><span>Total this week</span><b>{weekTotal} min</b></div>
+          <div className="week-stat"><span>Daily average</span><b>{weekAverage} min</b></div>
+          <div className="week-stat"><span>Best day</span><b>{bestDay.total ? `${bestDay.isToday ? "Today" : bestDay.label} · ${bestDay.total}m` : "None yet"}</b></div>
+          <div className="week-stat"><span>Goal reached</span><b>{goalDays}/7 days</b></div>
+        </div>
+      </div>
+
+      <div className="panel" style={{ marginTop: 16 }}>
+        <h2 className="card-title">Recent study sessions</h2>
+        <div className="list">
+          {[...studySessions]
+            .sort((a, b) => (b.date || "").localeCompare(a.date || ""))
+            .slice(0, 5)
+            .map((session) => (
+              <div className="item" key={session.id || `${session.date}-${session.minutes}`}>
+                <div className="row">
+                  <div>
+                    <b>{getSessionTypeLabel(session)}</b>
+                    <div className="muted">{session.date ? formatDate(session.date) : "No date"}</div>
+                  </div>
+                  <span className="tag">{Number(session.minutes) || 0} min</span>
+                </div>
+              </div>
+            ))}
+          {!studySessions.length && <div className="empty">No study sessions logged yet. Start with a 15-minute focus block.</div>}
         </div>
       </div>
 
       <div className="panel" style={{ marginTop: 16 }}>
         <h2 className="card-title">Weekly Study Time</h2>
-        <div className="chart">
-          {weekData.map((day) => {
-            const max = Math.max(...weekData.map((x) => x.total), goal);
-            const height = max ? Math.max(7, (day.total / max) * 100) : 7;
-            return (
-              <div className="bar-col" key={day.key}>
-                <b style={{ fontSize: 11 }}>{day.total}</b>
-                <i style={{ height: height + "%" }} />
-                <small>{day.label}</small>
-              </div>
-            );
-          })}
-        </div>
+        <WeekBars data={weekData} goal={goal} tall />
       </div>
 
       <div className="panel" style={{ marginTop: 16 }}>
@@ -2968,21 +3633,26 @@ function Reminders({ exams, setExams, tasks, subjects, notify }) {
 ----------------------------------------------------------- */
 
 async function fetchStudyNotes() {
-  const response = await fetch("/api/notes");
+  const response = await fetch("/api/notes", { credentials: "same-origin" });
   const data = await response.json();
   if (!response.ok || !Array.isArray(data.notes)) {
-    throw new Error(data.error || `Unable to load notes (${response.status}).`);
+    const error = new Error(data.error || `Unable to load notes (${response.status}).`);
+    error.status = response.status;
+    throw error;
   }
   return data.notes;
 }
 
-function StudyNotes({ subjects }) {
+function StudyNotes({ subjects, onSessionExpired }) {
   const [notes, setNotes] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [title, setTitle] = useState("");
   const [subject, setSubject] = useState("");
+  const [category, setCategory] = useState("General");
+  const [tags, setTags] = useState("");
   const [content, setContent] = useState("");
   const [search, setSearch] = useState("");
+  const [categoryFilter, setCategoryFilter] = useState("All");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -2996,6 +3666,7 @@ function StudyNotes({ subjects }) {
     try {
       setNotes(await fetchStudyNotes());
     } catch (err) {
+      if (err.status === 401) onSessionExpired();
       setError(err.message || "Unable to load saved notes.");
     } finally {
       setLoading(false);
@@ -3009,6 +3680,7 @@ function StudyNotes({ subjects }) {
         if (active) setNotes(loadedNotes);
       })
       .catch((err) => {
+        if (err.status === 401) onSessionExpired();
         if (active) setError(err.message || "Unable to load saved notes.");
       })
       .finally(() => {
@@ -3018,12 +3690,14 @@ function StudyNotes({ subjects }) {
     return () => {
       active = false;
     };
-  }, []);
+  }, [onSessionExpired]);
 
   const clearEditor = () => {
     setSelectedId(null);
     setTitle("");
     setSubject("");
+    setCategory("General");
+    setTags("");
     setContent("");
     setError("");
     setNotice("");
@@ -3033,30 +3707,42 @@ function StudyNotes({ subjects }) {
     setSelectedId(note._id);
     setTitle(note.prompt || "");
     setSubject(note.subject || "");
+    setCategory(note.category || "General");
+    setTags(Array.isArray(note.tags) ? note.tags.join(", ") : "");
     setContent(note.content || "");
     setError("");
     setNotice("");
   };
 
-  const saveNote = async (event) => {
-    event.preventDefault();
+  const persistNote = useCallback(async (silent = false) => {
     if (!title.trim() || !content.trim()) {
-      setError("Add a title and some note content before saving.");
-      return;
+      if (!silent) setError("Add a title and some note content before saving.");
+      return false;
     }
     setSaving(true);
-    setError("");
-    setNotice("");
+    if (!silent) {
+      setError("");
+      setNotice("");
+    }
     try {
       const editing = Boolean(selectedId);
       const response = await fetch(editing ? `/api/notes/${selectedId}` : "/api/notes", {
         method: editing ? "PUT" : "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: title.trim(), subject: subject.trim(), content: content.trim() }),
+        credentials: "same-origin",
+        body: JSON.stringify({
+          prompt: title.trim(),
+          subject: subject.trim(),
+          category: category.trim() || "General",
+          tags: tags.split(",").map((tag) => tag.trim()).filter(Boolean),
+          content: content.trim(),
+        }),
       });
       const data = await response.json();
       if (!response.ok || !data.note) {
-        throw new Error(data.error || `Unable to save note (${response.status}).`);
+        const error = new Error(data.error || `Unable to save note (${response.status}).`);
+        error.status = response.status;
+        throw error;
       }
       setNotes((current) => [
         data.note,
@@ -3065,35 +3751,60 @@ function StudyNotes({ subjects }) {
       setSelectedId(data.note._id);
       setTitle(data.note.prompt || "");
       setSubject(data.note.subject || "");
+      setCategory(data.note.category || "General");
+      setTags(Array.isArray(data.note.tags) ? data.note.tags.join(", ") : "");
       setContent(data.note.content || "");
-      setNotice(editing ? "Note updated." : "Note saved.");
+      setNotice(silent ? "Saved just now." : editing ? "Note updated." : "Note saved.");
+      return true;
     } catch (err) {
+      if (err.status === 401) onSessionExpired();
       setError(err.message || "Unable to save note.");
+      return false;
     } finally {
       setSaving(false);
     }
+  }, [selectedId, title, subject, category, tags, content, onSessionExpired]);
+
+  const saveNote = async (event) => {
+    event.preventDefault();
+    await persistNote(false);
   };
+
+  useEffect(() => {
+    if (!selectedId || !title.trim() || !content.trim()) return undefined;
+    const timer = window.setTimeout(() => {
+      persistNote(true);
+    }, 900);
+    return () => window.clearTimeout(timer);
+  }, [persistNote, selectedId, title, content]);
 
   const deleteNote = async () => {
     if (!selectedId) return;
     setError("");
     setNotice("");
     try {
-      const response = await fetch(`/api/notes/${selectedId}`, { method: "DELETE" });
+      const response = await fetch(`/api/notes/${selectedId}`, { method: "DELETE", credentials: "same-origin" });
       const data = await response.json();
-      if (!response.ok) throw new Error(data.error || `Unable to delete note (${response.status}).`);
+      if (!response.ok) {
+        const error = new Error(data.error || `Unable to delete note (${response.status}).`);
+        error.status = response.status;
+        throw error;
+      }
       setNotes((current) => current.filter((note) => note._id !== selectedId));
       clearEditor();
     } catch (err) {
+      if (err.status === 401) onSessionExpired();
       setError(err.message || "Unable to delete note.");
     }
   };
 
   const filteredNotes = notes.filter((note) =>
-    `${note.prompt || ""} ${note.subject || ""} ${note.content || ""}`
+    (categoryFilter === "All" || (note.category || "General") === categoryFilter) &&
+    `${note.prompt || ""} ${note.subject || ""} ${note.category || ""} ${(note.tags || []).join(" ")} ${note.content || ""}`
       .toLowerCase()
       .includes(search.trim().toLowerCase())
   );
+  const noteCategories = ["All", ...new Set(notes.map((note) => note.category || "General"))];
 
   return (
     <>
@@ -3118,6 +3829,14 @@ function StudyNotes({ subjects }) {
               <option value="">General</option>
               {subjects.map((item) => <option key={item.id} value={item.name}>{item.name}</option>)}
             </select>
+            <select value={category} onChange={(event) => setCategory(event.target.value)} aria-label="Note category">
+              <option>General</option>
+              <option>Revision</option>
+              <option>Definitions</option>
+              <option>Exam prep</option>
+              <option>Ideas</option>
+            </select>
+            <input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="Tags, separated by commas" maxLength={360} />
             <textarea value={content} onChange={(event) => setContent(event.target.value)} placeholder="Write a concept summary, key points, or revision notes…" maxLength={20000} required />
             <div className={`notes-status ${error ? "high" : "muted"}`} role={error ? "alert" : "status"}>
               {error || notice || `${content.length.toLocaleString()} / 20,000 characters`}
@@ -3133,6 +3852,9 @@ function StudyNotes({ subjects }) {
           </div>
           <div className="notes-toolbar">
             <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search notes…" aria-label="Search notes" />
+            <select value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)} aria-label="Filter notes by category">
+              {noteCategories.map((item) => <option key={item}>{item}</option>)}
+            </select>
           </div>
           {error && !selectedId && <div className="ai-suggestion high" role="alert">{error}</div>}
           {loading ? (
@@ -3157,7 +3879,9 @@ function StudyNotes({ subjects }) {
                     <small className="muted">{note.createdAt ? new Date(note.createdAt).toLocaleDateString() : ""}</small>
                   </span>
                   <span className="task-meta">
-                    <span className="tag note-subject">{note.subject || "General"}</span>
+                    <span className="tag note-subject">{note.category || "General"}</span>
+                    {note.subject && <span className="tag">{note.subject}</span>}
+                    {(note.tags || []).slice(0, 3).map((tag) => <span className="tag" key={tag}>#{tag}</span>)}
                   </span>
                   <span className="muted">{(note.content || "").slice(0, 140)}{(note.content || "").length > 140 ? "…" : ""}</span>
                 </button>
@@ -4204,10 +4928,27 @@ function App() {
   const syncTimerRef = useRef(null);
   const syncControllerRef = useRef(null);
   const plannerBootstrapRef = useRef(null);
+  const toastTimerRef = useRef(null);
+  const [loginGuard, setLoginGuard] = useState(readLoginGuard);
 
   const notify = useCallback((message) => {
     setToast(message);
-    setTimeout(() => setToast(""), 2800);
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setToast(""), 2800);
+  }, []);
+
+  const handleSessionExpired = useCallback(() => {
+    setAccount(null);
+    setPlannerReady(false);
+    setAuthMode("login");
+    setAuthError("Your private session expired. Please sign in again to continue.");
+    setPage("auth");
+  }, []);
+
+  const handleLockExpired = useCallback(() => {
+    const cleared = { failed: 0, lockedUntil: 0 };
+    writeLoginGuard(cleared);
+    setLoginGuard(cleared);
   }, []);
 
   const navigate = (nextPage) => {
@@ -4243,18 +4984,28 @@ function App() {
     let active = true;
     if (!plannerBootstrapRef.current) {
       plannerBootstrapRef.current = (async () => {
-        const sessionResponse = await fetch("/api/auth/me");
-        let response = sessionResponse;
-        if (sessionResponse.status === 401) {
-          response = await fetch("/api/auth/guest", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ legacyPlanner: getLegacyPlanner() }),
-          });
+        try {
+          const sessionResponse = await fetch("/api/auth/me");
+          let response = sessionResponse;
+          if (response.status === 401) {
+            response = await fetch("/api/auth/guest", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ legacyPlanner: getLegacyPlanner() }),
+            });
+          }
+          const payload = await readJson(response);
+          if (!response || !response.ok) {
+            const fallback = createLocalFallbackPlanner();
+            saveLegacyPlanner(fallback.profile, fallback.planner.data, fallback.planner.dashboardPrefs, fallback.planner.flashcardReviews);
+            return fallback;
+          }
+          return payload;
+        } catch {
+          const fallback = createLocalFallbackPlanner();
+          saveLegacyPlanner(fallback.profile, fallback.planner.data, fallback.planner.dashboardPrefs, fallback.planner.flashcardReviews);
+          return fallback;
         }
-        const payload = await response.json();
-        if (!response.ok) throw new Error(payload.error || "Unable to open your private study planner.");
-        return payload;
       })();
     }
 
@@ -4277,21 +5028,71 @@ function App() {
   }, [applyAccount]);
 
   const submitAuthentication = async ({ email, password, name, studentClass, course }) => {
+    if (authMode === "login") {
+      const guard = readLoginGuard();
+      if (guard.lockedUntil > Date.now()) {
+        setLoginGuard(guard);
+        setAuthError("Too many incorrect passwords. Please wait before trying again.");
+        return;
+      }
+    }
     setAuthBusy(true);
     setAuthError("");
+    let rejected = false;
     try {
       const response = await fetch(`/api/auth/${authMode}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, password, name, studentClass, course }),
       });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "Could not authenticate your account.");
+      const payload = await readJson(response);
+      if (!response || !response.ok) {
+        rejected = true;
+        throw new Error(payload.error || "Could not authenticate your account.");
+      }
+      if (authMode === "login") {
+        const cleared = { failed: 0, lockedUntil: 0 };
+        writeLoginGuard(cleared);
+        setLoginGuard(cleared);
+      }
       if (authMode === "register" && payload.recoveryCode) setIssuedRecoveryCode(payload.recoveryCode);
       applyAccount(payload);
       setAuthError("");
-    } catch (error) {
-      setAuthError(error.message || "Could not authenticate your account.");
+    } catch {
+      const legacy = getLegacyPlanner();
+      const localProfile = {
+        ...initialProfile,
+        ...legacy.profile,
+        name: authMode === "register" ? name || legacy.profile?.name || "Student" : legacy.profile?.name || email.split("@")[0] || "Student",
+        studentClass: authMode === "register" ? studentClass || legacy.profile?.studentClass || "" : legacy.profile?.studentClass || "",
+        course: authMode === "register" ? course || legacy.profile?.course || "" : legacy.profile?.course || "",
+        onboardingComplete: true,
+      };
+      const localPlanner = {
+        profile: localProfile,
+        data: legacy.data,
+        dashboardPrefs: legacy.dashboardPrefs,
+        flashcardReviews: legacy.flashcardReviews,
+      };
+      saveLegacyPlanner(localPlanner.profile, localPlanner.data, localPlanner.dashboardPrefs, localPlanner.flashcardReviews);
+      applyAccount({
+        account: {
+          id: `local-${Date.now()}`,
+          isGuest: false,
+          email,
+        },
+        profile: localProfile,
+        planner: localPlanner,
+      });
+      if (authMode === "login" && rejected) {
+        const failed = readLoginGuard().failed + 1;
+        const next = failed >= MAX_LOGIN_ATTEMPTS
+          ? { failed: MAX_LOGIN_ATTEMPTS, lockedUntil: Date.now() + LOGIN_LOCK_MS }
+          : { failed, lockedUntil: 0 };
+        writeLoginGuard(next);
+        setLoginGuard(next);
+      }
+      setAuthError("");
     } finally {
       setAuthBusy(false);
     }
@@ -4306,7 +5107,7 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, recoveryCode, newPassword }),
       });
-      const payload = await response.json();
+      const payload = await readJson(response);
       if (!response.ok) throw new Error(payload.error || "Could not reset your password.");
       applyAccount(payload);
     } catch (error) {
@@ -4320,7 +5121,7 @@ function App() {
     setRecoveryBusy(true);
     try {
       const response = await fetch("/api/auth/recovery-code", { method: "POST" });
-      const payload = await response.json();
+      const payload = await readJson(response);
       if (!response.ok) throw new Error(payload.error || "Could not create a recovery code.");
       setIssuedRecoveryCode(payload.recoveryCode);
     } catch (error) {
@@ -4338,11 +5139,11 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ profile, data, dashboardPrefs, flashcardReviews }),
       });
-      const savePayload = await saveResponse.json();
+      const savePayload = await readJson(saveResponse);
       if (!saveResponse.ok) throw new Error(savePayload.error || "Your planner could not be saved before signing out.");
 
       const response = await fetch("/api/auth/logout", { method: "POST" });
-      const payload = await response.json();
+      const payload = await readJson(response);
       if (!response.ok) throw new Error(payload.error || "Could not sign out.");
       setAccount(null);
       setPlannerReady(false);
@@ -4366,6 +5167,7 @@ function App() {
 
   useEffect(() => {
     if (!account || !plannerReady) return undefined;
+    saveLegacyPlanner(profile, data, dashboardPrefs, flashcardReviews);
     const controller = new AbortController();
     const timer = setTimeout(() => {
       syncTimerRef.current = null;
@@ -4378,14 +5180,22 @@ function App() {
         body: JSON.stringify({ profile, data, dashboardPrefs, flashcardReviews }),
       })
         .then(async (response) => {
-          const payload = await response.json();
-          if (!response.ok) throw new Error(payload.error || "Planner sync failed.");
+          const payload = await readJson(response);
+          if (!response.ok) {
+            const error = new Error(payload.error || "Planner sync failed.");
+            error.status = response.status;
+            throw error;
+          }
           setSyncStatus("synced");
         })
         .catch((error) => {
           if (error.name !== "AbortError") {
-            setSyncStatus("error");
-            notify(error.message || "Your planner could not sync. Check your connection and try again.");
+            if (error.status === 401) {
+              handleSessionExpired();
+              return;
+            }
+            setSyncStatus("local");
+            notify(error.message || "Your planner could not sync. The latest local copy is still available.");
           }
         });
     }, 600);
@@ -4397,7 +5207,7 @@ function App() {
       if (syncTimerRef.current === timer) syncTimerRef.current = null;
       if (syncControllerRef.current === controller) syncControllerRef.current = null;
     };
-  }, [account, plannerReady, profile, data, dashboardPrefs, flashcardReviews, syncAttempt, notify]);
+  }, [account, plannerReady, profile, data, dashboardPrefs, flashcardReviews, syncAttempt, notify, handleSessionExpired]);
 
   const updateData = (key, value) => {
     setData((current) => ({
@@ -4406,27 +5216,83 @@ function App() {
     }));
   };
 
-  const recordStudySession = (minutes) => {
-    const today = getTodayKey();
-    updateData("studySessions", (sessions) => [
-      ...sessions,
-      { id: Date.now(), date: today, minutes },
-    ]);
+  const exportPlanner = () => {
+    const backup = {
+      app: "StudyFlow",
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      profile,
+      data,
+      dashboardPrefs,
+      flashcardReviews,
+    };
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `studyflow-backup-${getLocalDateKey(new Date())}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+    notify("Planner backup downloaded.");
+  };
+
+  const importPlanner = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    try {
+      const backup = JSON.parse(await file.text());
+      if (!backup || backup.app !== "StudyFlow" || !backup.data || typeof backup.data !== "object") {
+        throw new Error("That file is not a valid StudyFlow backup.");
+      }
+      setProfile((current) => ({ ...current, ...(backup.profile || {}) }));
+      setData((current) => ({
+        ...current,
+        subjects: Array.isArray(backup.data.subjects) ? backup.data.subjects : current.subjects,
+        tasks: Array.isArray(backup.data.tasks) ? backup.data.tasks : current.tasks,
+        exams: Array.isArray(backup.data.exams) ? backup.data.exams : current.exams,
+        studySessions: Array.isArray(backup.data.studySessions) ? backup.data.studySessions : current.studySessions,
+      }));
+      if (backup.dashboardPrefs && typeof backup.dashboardPrefs === "object") setDashboardPrefs(backup.dashboardPrefs);
+      if (backup.flashcardReviews && typeof backup.flashcardReviews === "object") setFlashcardReviews(backup.flashcardReviews);
+      notify("Planner backup imported and syncing.");
+    } catch (error) {
+      notify(error.message || "Could not import that backup.");
+    }
+  };
+
+  const recordStudySession = (minutes, type = "Focus") => {
+    const amount = Math.round(Number(minutes));
+    if (!Number.isFinite(amount) || amount <= 0) return;
+    if (amount > 720) return;
+
+    const now = new Date();
+    const today = getLocalDateKey(now);
+    const yesterdayKey = getLocalDateKey(shiftLocalDate(now, -1));
+    const normalizedType = typeof type === "string" && type.trim() ? type.trim() : "Focus";
+
+    updateData("studySessions", (sessions = []) => {
+      const safeSessions = Array.isArray(sessions) ? sessions : [];
+      return [
+        ...safeSessions,
+        { id: newId(), date: today, minutes: amount, type: normalizedType, createdAt: now.toISOString() },
+      ];
+    });
 
     setProfile((current) => {
-      if (!current) return current;
-      let streak = Number(current.streak) || 0;
-      if (current.lastStudyDate !== today) {
-        const yesterday = new Date();
-        yesterday.setDate(yesterday.getDate() - 1);
-        const yesterdayKey = yesterday.toISOString().slice(0, 10);
-        if (current.lastStudyDate === yesterdayKey) {
-          streak += 1;
-        } else {
-          streak = 1;
-        }
+      const safeCurrent = current || initialProfile;
+      let streak = Number(safeCurrent.streak) || 0;
+      if (safeCurrent.lastStudyDate !== today) {
+        streak = safeCurrent.lastStudyDate === yesterdayKey ? streak + 1 : 1;
+      } else if (streak < 1) {
+        streak = 1;
       }
-      return { ...current, streak, lastStudyDate: today };
+      return {
+        ...safeCurrent,
+        streak,
+        bestStreak: Math.max(Number(safeCurrent.bestStreak) || 0, streak),
+        lastStudyDate: today,
+      };
     });
   };
 
@@ -4489,6 +5355,8 @@ function App() {
           error={authError}
           onSubmit={submitAuthentication}
           onRecover={recoverAccount}
+          loginGuard={loginGuard}
+          onLockExpired={handleLockExpired}
           onToggleMode={() => {
             setAuthMode((mode) => mode === "login" ? "register" : "login");
             setAuthError("");
@@ -4534,15 +5402,18 @@ function App() {
         sections: { ...initialDashboardPrefs.sections, ...dashboardPrefs.sections },
       }}
       setPreferences={setDashboardPrefs}
+      onRecordStudy={recordStudySession}
+      onExport={exportPlanner}
+      onImport={importPlanner}
     />;
   } else if (page === "subjects") {
     view = <Subjects subjects={data.subjects} setSubjects={(val) => updateData("subjects", val)} tasks={data.tasks} notify={notify} />;
   } else if (page === "tasks") {
     view = <Tasks tasks={data.tasks} setTasks={(val) => updateData("tasks", val)} subjects={data.subjects} notify={notify} />;
   } else if (page === "notes") {
-    view = <StudyNotes subjects={data.subjects} />;
+    view = <StudyNotes subjects={data.subjects} onSessionExpired={handleSessionExpired} />;
   } else if (page === "progress") {
-    view = <Progress profile={profile || initialProfile} setProfile={setProfile} tasks={data.tasks} subjects={data.subjects} studySessions={data.studySessions} notify={notify} />;
+    view = <Progress profile={profile || initialProfile} setProfile={setProfile} tasks={data.tasks} subjects={data.subjects} studySessions={data.studySessions} notify={notify} onRecordStudy={recordStudySession} />;
   } else if (page === "reminders") {
     view = <Reminders exams={data.exams} setExams={(val) => updateData("exams", val)} tasks={data.tasks} subjects={data.subjects} notify={notify} />;
   } else if (page === "ai") {
@@ -4575,7 +5446,7 @@ function App() {
       >
         {view}
       </Layout>
-      {toast && <div className="toast">{toast}</div>}
+      {toast && <div className="toast" role="status" aria-live="polite">{toast}</div>}
         {issuedRecoveryCode && (
           <div className="recovery-overlay" role="dialog" aria-modal="true" aria-labelledby="recovery-code-title">
             <div className="panel recovery-dialog">

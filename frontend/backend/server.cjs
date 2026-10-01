@@ -92,6 +92,14 @@ const noteSchema = new mongoose.Schema(
       type: String,
       default: "",
     },
+    category: {
+      type: String,
+      default: "General",
+    },
+    tags: {
+      type: [String],
+      default: [],
+    },
   },
   {
     timestamps: true,
@@ -132,6 +140,52 @@ const userSchema = new mongoose.Schema(
   { timestamps: true }
 );
 const User = mongoose.model("StudyFlowUser", userSchema);
+const memoryUsers = new Map();
+const memoryNotes = new Map();
+
+const createMemoryId = () => (typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+
+const normalizeMemoryUser = (user) => {
+  const base = user && typeof user === "object" ? user : {};
+  const profile = cleanProfile(base.profile || base.planner?.profile, base.email ? base.email.split("@")[0] || "Student" : "Student");
+  const planner = base.planner && typeof base.planner === "object"
+    ? cleanPlannerState(base.planner, profile)
+    : { profile, data: { subjects: [], tasks: [], exams: [], studySessions: [] }, dashboardPrefs: { stats: ["streak", "today", "tasks", "subjects"], sections: { tasks: true, exams: true, subjects: true } }, flashcardReviews: {} };
+
+  return {
+    ...base,
+    _id: String(base._id || base.id || createMemoryId()),
+    email: typeof base.email === "string" ? base.email : "",
+    isGuest: Boolean(base.isGuest),
+    passwordHash: typeof base.passwordHash === "string" ? base.passwordHash : null,
+    recoveryCodeHash: typeof base.recoveryCodeHash === "string" ? base.recoveryCodeHash : null,
+    sessionVersion: Number(base.sessionVersion) || 0,
+    profile,
+    planner,
+    createdAt: base.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+};
+
+const saveMemoryUser = (user) => {
+  const normalized = normalizeMemoryUser(user);
+  memoryUsers.set(String(normalized._id), normalized);
+  return normalized;
+};
+
+const getMemoryUserById = (id) => {
+  if (!id) return null;
+  const user = memoryUsers.get(String(id));
+  return user ? normalizeMemoryUser(user) : null;
+};
+
+const getMemoryUserByEmail = (email) => {
+  const target = normalizeEmail(email);
+  for (const user of memoryUsers.values()) {
+    if (normalizeEmail(user.email) === target) return normalizeMemoryUser(user);
+  }
+  return null;
+};
 
 const cleanProfile = (input, fallbackName = "Student") => {
   const source = input && typeof input === "object" ? input : {};
@@ -211,10 +265,19 @@ const regenerateSession = (req, userId, sessionVersion = 0) => new Promise((reso
 });
 
 const requireDatabase = (req, res, next) => {
-  if (mongoose.connection.readyState !== 1) {
-    return res.status(503).json({ success: false, error: "Account storage is unavailable until MongoDB is connected." });
-  }
-  next();
+  if (mongoose.connection.readyState === 1) return next();
+  const localRoutes = [
+    "/api/auth/guest",
+    "/api/auth/register",
+    "/api/auth/recover",
+    "/api/auth/login",
+    "/api/auth/logout",
+    "/api/auth/me",
+    "/api/planner",
+  ];
+  if (localRoutes.includes(req.path)) return next();
+  if (req.path.startsWith("/api/notes")) return next();
+  return res.status(503).json({ success: false, error: "Account storage is unavailable until MongoDB is connected." });
 };
 
 const normalizeEmail = (email) => typeof email === "string" ? email.trim().toLowerCase() : "";
@@ -241,13 +304,18 @@ const requireAuth = async (req, res, next) => {
     return res.status(401).json({ success: false, error: "A private browser planner session is required." });
   }
   try {
-    const user = await User.findById(req.session.userId);
+    let user = null;
+    if (mongoose.connection.readyState === 1) {
+      user = await User.findById(req.session.userId);
+    } else {
+      user = getMemoryUserById(req.session.userId);
+    }
     if (!user) {
       req.session.destroy(() => {});
       return res.status(401).json({ success: false, error: "Your private browser planner session has expired." });
     }
     req.user = user;
-    if ((req.session.sessionVersion || 0) !== (user.sessionVersion || 0)) {
+    if (mongoose.connection.readyState === 1 && (req.session.sessionVersion || 0) !== (user.sessionVersion || 0)) {
       req.session.destroy(() => {});
       return res.status(401).json({ success: false, error: "Your private browser planner session has expired." });
     }
@@ -316,6 +384,18 @@ async function createGuestAccount(req, res) {
     const profile = cleanProfile(legacyProfile);
     const planner = cleanPlannerState(req.body?.legacyPlanner, profile);
     const guestId = crypto.randomBytes(24).toString("hex");
+    if (mongoose.connection.readyState !== 1) {
+      const user = saveMemoryUser({
+        _id: guestId,
+        email: `guest-${guestId}@studyflow.invalid`,
+        isGuest: true,
+        profile,
+        planner,
+        sessionVersion: 0,
+      });
+      await regenerateSession(req, user._id, user.sessionVersion || 0);
+      return sendAccount(res, user);
+    }
     const user = await User.create({
       email: `guest-${guestId}@studyflow.invalid`,
       isGuest: true,
@@ -351,6 +431,29 @@ app.post("/api/auth/register", requireDatabase, limitAccountAuth, async (req, re
   }
 
   try {
+    if (mongoose.connection.readyState !== 1) {
+      const existing = getMemoryUserByEmail(email);
+      if (existing) {
+        return res.status(409).json({ success: false, error: "An account with this email already exists. Please log in." });
+      }
+      const hashedPassword = await passwordHash(password);
+      const recoveryCode = createRecoveryCode();
+      const hashedRecoveryCode = await passwordHash(recoveryCode);
+      const profile = cleanProfile({ ...initialPlannerState().profile, ...studentDetails, onboardingComplete: true }, studentDetails.name || "Student");
+      const planner = cleanPlannerState(initialPlannerState(), profile);
+      const user = saveMemoryUser({
+        _id: createMemoryId(),
+        email,
+        isGuest: false,
+        passwordHash: hashedPassword,
+        recoveryCodeHash: hashedRecoveryCode,
+        sessionVersion: 0,
+        profile,
+        planner,
+      });
+      await regenerateSession(req, user._id, user.sessionVersion || 0);
+      return sendAccount(res, user, { recoveryCode });
+    }
     if (await User.exists({ email })) {
       return res.status(409).json({ success: false, error: "An account with this email already exists. Please log in." });
     }
@@ -398,6 +501,10 @@ app.post("/api/auth/recovery-code", requireDatabase, requireAuth, async (req, re
   try {
     const recoveryCode = createRecoveryCode();
     const hashedRecoveryCode = await passwordHash(recoveryCode);
+    if (mongoose.connection.readyState !== 1) {
+      const user = saveMemoryUser({ ...req.user, recoveryCodeHash: hashedRecoveryCode, updatedAt: new Date().toISOString() });
+      return res.json({ success: true, recoveryCode });
+    }
     await User.updateOne({ _id: req.user._id }, { $set: { recoveryCodeHash: hashedRecoveryCode } });
     return res.json({ success: true, recoveryCode });
   } catch (error) {
@@ -418,6 +525,17 @@ app.post("/api/auth/recover", requireDatabase, limitAccountAuth, async (req, res
   }
 
   try {
+    if (mongoose.connection.readyState !== 1) {
+      const user = getMemoryUserByEmail(email);
+      const recoveryCodeMatches = user && await verifyPassword(recoveryCode, user.recoveryCodeHash);
+      if (!user || !recoveryCodeMatches) {
+        return res.status(400).json({ success: false, error: "Email or recovery code is incorrect." });
+      }
+      const hashedPassword = await passwordHash(newPassword);
+      const refreshedUser = saveMemoryUser({ ...user, passwordHash: hashedPassword, recoveryCodeHash: null, sessionVersion: (user.sessionVersion || 0) + 1, updatedAt: new Date().toISOString() });
+      await regenerateSession(req, refreshedUser._id, refreshedUser.sessionVersion || 0);
+      return sendAccount(res, refreshedUser);
+    }
     const user = await User.findOne({ email, isGuest: false }).select("+recoveryCodeHash");
     const recoveryCodeMatches = await verifyPassword(recoveryCode, user?.recoveryCodeHash);
     if (!user || !recoveryCodeMatches) {
@@ -456,6 +574,15 @@ app.post("/api/auth/login", requireDatabase, limitAccountAuth, async (req, res, 
   }
 
   try {
+    if (mongoose.connection.readyState !== 1) {
+      const user = getMemoryUserByEmail(email);
+      const passwordMatches = user && await verifyPassword(password, user.passwordHash);
+      if (!user || !passwordMatches) {
+        return res.status(401).json({ success: false, error: "Email or password is incorrect." });
+      }
+      await regenerateSession(req, user._id, user.sessionVersion || 0);
+      return sendAccount(res, user);
+    }
     const user = await User.findOne({ email, isGuest: false }).select("+passwordHash");
     const passwordMatches = await verifyPassword(password, user?.passwordHash);
     if (!user || !passwordMatches) {
@@ -485,9 +612,9 @@ app.post("/api/auth/logout", (req, res, next) => {
 app.get("/api/auth/me", requireDatabase, requireAuth, (req, res) => sendAccount(res, req.user));
 app.get("/api/health", (req, res) => {
   const databaseReady = mongoose.connection.readyState === 1;
-  return res.status(databaseReady ? 200 : 503).json({
-    success: databaseReady,
-    database: databaseReady ? "connected" : "unavailable",
+  return res.status(200).json({
+    success: true,
+    database: databaseReady ? "connected" : "local-memory",
     aiConfigured: Boolean(GEMINI_API_KEY),
   });
 });
@@ -503,6 +630,11 @@ app.put("/api/planner", requireDatabase, requireAuth, async (req, res) => {
   try {
     const profile = cleanProfile(req.body.profile, req.user.profile?.name || "Student");
     const planner = cleanPlannerState(req.body, profile);
+    if (mongoose.connection.readyState !== 1) {
+      const user = saveMemoryUser({ ...req.user, profile, planner, updatedAt: new Date().toISOString() });
+      req.user = user;
+      return res.json({ success: true });
+    }
     await User.updateOne({ _id: req.user._id }, { $set: { profile, planner } });
     return res.json({ success: true });
   } catch (error) {
@@ -747,7 +879,7 @@ app.post("/api/ai/quiz", requireAuth, async (req, res) => {
 
 app.post("/api/notes", requireDatabase, requireAuth, async (req, res) => {
   try {
-    const { prompt, content, subject } = req.body;
+    const { prompt, content, subject, category, tags } = req.body;
 
     if (typeof content !== "string" || !content.trim()) {
       return res.status(400).json({
@@ -756,11 +888,29 @@ app.post("/api/notes", requireDatabase, requireAuth, async (req, res) => {
       });
     }
 
+    if (mongoose.connection.readyState !== 1) {
+      const note = {
+        _id: createMemoryId(),
+        userId: req.user._id,
+        prompt: typeof prompt === "string" ? prompt.trim() : "",
+        content: content.trim(),
+        subject: typeof subject === "string" ? subject.trim() : "",
+        category: typeof category === "string" && category.trim() ? category.trim().slice(0, 40) : "General",
+        tags: Array.isArray(tags) ? tags.filter((tag) => typeof tag === "string").map((tag) => tag.trim().slice(0, 30)).filter(Boolean).slice(0, 12) : [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      memoryNotes.set(note._id, note);
+      return res.status(201).json({ success: true, note });
+    }
+
     const note = new Note({
       userId: req.user._id,
       prompt: typeof prompt === "string" ? prompt.trim() : "",
       content: content.trim(),
       subject: typeof subject === "string" ? subject.trim() : "",
+      category: typeof category === "string" && category.trim() ? category.trim().slice(0, 40) : "General",
+      tags: Array.isArray(tags) ? tags.filter((tag) => typeof tag === "string").map((tag) => tag.trim().slice(0, 30)).filter(Boolean).slice(0, 12) : [],
     });
 
     await note.save();
@@ -785,9 +935,9 @@ app.post("/api/notes", requireDatabase, requireAuth, async (req, res) => {
 app.put("/api/notes/:id", requireDatabase, requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const { prompt, content, subject } = req.body;
+    const { prompt, content, subject, category, tags } = req.body;
 
-    if (!mongoose.isValidObjectId(id)) {
+    if (!id || typeof id !== "string") {
       return res.status(400).json({
         success: false,
         error: "Invalid note ID.",
@@ -808,12 +958,42 @@ app.put("/api/notes/:id", requireDatabase, requireAuth, async (req, res) => {
       });
     }
 
+    if (mongoose.connection.readyState !== 1) {
+      const note = memoryNotes.get(id);
+      if (!note || String(note.userId) !== String(req.user._id)) {
+        return res.status(404).json({
+          success: false,
+          error: "Note not found.",
+        });
+      }
+      const updatedNote = {
+        ...note,
+        prompt: prompt.trim(),
+        content: content.trim(),
+        subject: typeof subject === "string" ? subject.trim() : "",
+        category: typeof category === "string" && category.trim() ? category.trim().slice(0, 40) : "General",
+        tags: Array.isArray(tags) ? tags.filter((tag) => typeof tag === "string").map((tag) => tag.trim().slice(0, 30)).filter(Boolean).slice(0, 12) : [],
+        updatedAt: new Date().toISOString(),
+      };
+      memoryNotes.set(id, updatedNote);
+      return res.json({ success: true, note: updatedNote });
+    }
+
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid note ID.",
+      });
+    }
+
     const note = await Note.findOneAndUpdate(
       { _id: id, userId: req.user._id },
       {
         prompt: prompt.trim(),
         content: content.trim(),
         subject: typeof subject === "string" ? subject.trim() : "",
+        category: typeof category === "string" && category.trim() ? category.trim().slice(0, 40) : "General",
+        tags: Array.isArray(tags) ? tags.filter((tag) => typeof tag === "string").map((tag) => tag.trim().slice(0, 30)).filter(Boolean).slice(0, 12) : [],
       },
       { returnDocument: "after", runValidators: true }
     );
@@ -841,6 +1021,12 @@ app.put("/api/notes/:id", requireDatabase, requireAuth, async (req, res) => {
 
 app.get("/api/notes", requireDatabase, requireAuth, async (req, res) => {
   try {
+    if (mongoose.connection.readyState !== 1) {
+      const notes = Array.from(memoryNotes.values())
+        .filter((note) => note.userId === req.user._id)
+        .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+      return res.json({ success: true, notes });
+    }
     const notes = await Note.find({ userId: req.user._id }).sort({ createdAt: -1 }).lean();
 
     return res.json({
@@ -863,6 +1049,28 @@ app.get("/api/notes", requireDatabase, requireAuth, async (req, res) => {
 app.delete("/api/notes/:id", requireDatabase, requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
+
+    if (!id || typeof id !== "string") {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid note ID.",
+      });
+    }
+
+    if (mongoose.connection.readyState !== 1) {
+      const note = memoryNotes.get(id);
+      if (!note || String(note.userId) !== String(req.user._id)) {
+        return res.status(404).json({
+          success: false,
+          error: "Note not found.",
+        });
+      }
+      memoryNotes.delete(id);
+      return res.json({
+        success: true,
+        message: "Note deleted successfully.",
+      });
+    }
 
     if (!mongoose.isValidObjectId(id)) {
       return res.status(400).json({
@@ -891,6 +1099,13 @@ app.delete("/api/notes/:id", requireDatabase, requireAuth, async (req, res) => {
       error: "Failed to delete note.",
     });
   }
+});
+
+app.use((error, req, res, next) => {
+  if (error?.type === "entity.parse.failed") {
+    return res.status(400).json({ success: false, error: "Request body must contain valid JSON." });
+  }
+  return next(error);
 });
 
 // --------------------------------------------------
