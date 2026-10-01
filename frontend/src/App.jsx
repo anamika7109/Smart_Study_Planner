@@ -2545,8 +2545,6 @@ function Dashboard({
   preferences,
   setPreferences,
   onRecordStudy,
-  onExport,
-  onImport,
 }) {
   const [timeGreeting, setTimeGreeting] = useState(getIndiaTimeGreeting);
   const [quoteIndex, setQuoteIndex] = useState(() => new Date().getDate() % motivationalQuotes.length);
@@ -2672,8 +2670,6 @@ function Dashboard({
           <div className="muted">{profile.course ? profile.course : "Your personalized study workspace"}</div>
         </div>
         <div className="actions">
-          <button className="ghost-btn" onClick={onExport}>↓ Export data</button>
-          <label className="ghost-btn" style={{ cursor: "pointer" }}>↑ Import data<input type="file" accept="application/json" onChange={onImport} style={{ display: "none" }} /></label>
           <button className="ghost-btn" onClick={() => navigate("flashcards")}>▤ Daily review</button>
           <button className="ghost-btn" onClick={() => navigate("schedule")}>◷ Plan week</button>
           <button className="ghost-btn" onClick={() => navigate("subjects")}>+ Subject</button>
@@ -3748,6 +3744,17 @@ async function fetchStudyNotes() {
   return data.notes;
 }
 
+function getNoteDraftSignature({ prompt, subject, category, tags, content }) {
+  const normalizedTags = Array.isArray(tags) ? tags : tags.split(",");
+  return JSON.stringify([
+    prompt.trim(),
+    subject.trim(),
+    category.trim() || "General",
+    normalizedTags.map((tag) => tag.trim()).filter(Boolean),
+    content.trim(),
+  ]);
+}
+
 function StudyNotes({ subjects, onSessionExpired }) {
   const [notes, setNotes] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
@@ -3762,6 +3769,8 @@ function StudyNotes({ subjects, onSessionExpired }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const saveInFlightRef = useRef(false);
+  const lastSavedDraftRef = useRef("");
 
   const loadNotes = async (showLoading = false) => {
     if (showLoading) {
@@ -3806,6 +3815,7 @@ function StudyNotes({ subjects, onSessionExpired }) {
     setContent("");
     setError("");
     setNotice("");
+    lastSavedDraftRef.current = "";
   };
 
   const selectNote = (note) => {
@@ -3817,6 +3827,13 @@ function StudyNotes({ subjects, onSessionExpired }) {
     setContent(note.content || "");
     setError("");
     setNotice("");
+    lastSavedDraftRef.current = getNoteDraftSignature({
+      prompt: note.prompt || "",
+      subject: note.subject || "",
+      category: note.category || "General",
+      tags: note.tags || [],
+      content: note.content || "",
+    });
   };
 
   const persistNote = useCallback(async (silent = false) => {
@@ -3824,6 +3841,8 @@ function StudyNotes({ subjects, onSessionExpired }) {
       if (!silent) setError("Add a title and some note content before saving.");
       return false;
     }
+    if (saveInFlightRef.current) return false;
+    saveInFlightRef.current = true;
     setSaving(true);
     if (!silent) {
       setError("");
@@ -3859,6 +3878,13 @@ function StudyNotes({ subjects, onSessionExpired }) {
       setCategory(data.note.category || "General");
       setTags(Array.isArray(data.note.tags) ? data.note.tags.join(", ") : "");
       setContent(data.note.content || "");
+      lastSavedDraftRef.current = getNoteDraftSignature({
+        prompt: data.note.prompt || "",
+        subject: data.note.subject || "",
+        category: data.note.category || "General",
+        tags: data.note.tags || [],
+        content: data.note.content || "",
+      });
       setNotice(silent ? "Saved just now." : editing ? "Note updated." : "Note saved.");
       return true;
     } catch (err) {
@@ -3866,6 +3892,7 @@ function StudyNotes({ subjects, onSessionExpired }) {
       setError(err.message || "Unable to save note.");
       return false;
     } finally {
+      saveInFlightRef.current = false;
       setSaving(false);
     }
   }, [selectedId, title, subject, category, tags, content, onSessionExpired]);
@@ -3876,12 +3903,14 @@ function StudyNotes({ subjects, onSessionExpired }) {
   };
 
   useEffect(() => {
-    if (!selectedId || !title.trim() || !content.trim()) return undefined;
+    if (!title.trim() || !content.trim()) return undefined;
+    const draftSignature = getNoteDraftSignature({ prompt: title, subject, category, tags, content });
+    if (draftSignature === lastSavedDraftRef.current) return undefined;
     const timer = window.setTimeout(() => {
       persistNote(true);
     }, 900);
     return () => window.clearTimeout(timer);
-  }, [persistNote, selectedId, title, content]);
+  }, [persistNote, title, subject, category, tags, content]);
 
   const deleteNote = async () => {
     if (!selectedId) return;
@@ -3919,30 +3948,30 @@ function StudyNotes({ subjects, onSessionExpired }) {
           <h1 className="title">Study Notes</h1>
           <div className="muted">Capture explanations, revision notes, and the ideas you want to remember.</div>
         </div>
-        <button className="primary-btn" onClick={clearEditor}>＋ New note</button>
+        <button className="primary-btn" onClick={clearEditor} disabled={saving}>＋ New note</button>
       </div>
 
       <div className="notes-layout">
         <section className="panel">
           <div className="row" style={{ marginBottom: 16 }}>
             <h2 className="card-title" style={{ margin: 0 }}>{selectedId ? "Edit note" : "Write a note"}</h2>
-            {selectedId && <button className="danger-btn" onClick={deleteNote}>Delete</button>}
+            {selectedId && <button className="danger-btn" onClick={deleteNote} disabled={saving}>Delete</button>}
           </div>
           <form className="notes-form" onSubmit={saveNote}>
-            <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Note title" maxLength={160} required />
-            <select value={subject} onChange={(event) => setSubject(event.target.value)}>
+            <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Note title" maxLength={160} required disabled={saving} />
+            <select value={subject} onChange={(event) => setSubject(event.target.value)} disabled={saving}>
               <option value="">General</option>
               {subjects.map((item) => <option key={item.id} value={item.name}>{item.name}</option>)}
             </select>
-            <select value={category} onChange={(event) => setCategory(event.target.value)} aria-label="Note category">
+            <select value={category} onChange={(event) => setCategory(event.target.value)} aria-label="Note category" disabled={saving}>
               <option>General</option>
               <option>Revision</option>
               <option>Definitions</option>
               <option>Exam prep</option>
               <option>Ideas</option>
             </select>
-            <input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="Tags, separated by commas" maxLength={360} />
-            <textarea value={content} onChange={(event) => setContent(event.target.value)} placeholder="Write a concept summary, key points, or revision notes…" maxLength={20000} required />
+            <input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="Tags, separated by commas" maxLength={360} disabled={saving} />
+            <textarea value={content} onChange={(event) => setContent(event.target.value)} placeholder="Write a concept summary, key points, or revision notes…" maxLength={20000} required disabled={saving} />
             <div className={`notes-status ${error ? "high" : "muted"}`} role={error ? "alert" : "status"}>
               {error || notice || `${content.length.toLocaleString()} / 20,000 characters`}
             </div>
@@ -3978,6 +4007,7 @@ function StudyNotes({ subjects, onSessionExpired }) {
                   type="button"
                   className={`item note-card ${selectedId === note._id ? "selected" : ""}`}
                   onClick={() => selectNote(note)}
+                  disabled={saving}
                 >
                   <span className="row">
                     <b>{note.prompt || "Untitled note"}</b>
@@ -5321,51 +5351,6 @@ function App() {
     }));
   };
 
-  const exportPlanner = () => {
-    const backup = {
-      app: "StudyFlow",
-      version: 1,
-      exportedAt: new Date().toISOString(),
-      profile,
-      data,
-      dashboardPrefs,
-      flashcardReviews,
-    };
-    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `studyflow-backup-${getLocalDateKey(new Date())}.json`;
-    link.click();
-    URL.revokeObjectURL(url);
-    notify("Planner backup downloaded.");
-  };
-
-  const importPlanner = async (event) => {
-    const file = event.target.files?.[0];
-    event.target.value = "";
-    if (!file) return;
-    try {
-      const backup = JSON.parse(await file.text());
-      if (!backup || backup.app !== "StudyFlow" || !backup.data || typeof backup.data !== "object") {
-        throw new Error("That file is not a valid StudyFlow backup.");
-      }
-      setProfile((current) => ({ ...current, ...(backup.profile || {}) }));
-      setData((current) => ({
-        ...current,
-        subjects: Array.isArray(backup.data.subjects) ? backup.data.subjects : current.subjects,
-        tasks: Array.isArray(backup.data.tasks) ? backup.data.tasks : current.tasks,
-        exams: Array.isArray(backup.data.exams) ? backup.data.exams : current.exams,
-        studySessions: Array.isArray(backup.data.studySessions) ? backup.data.studySessions : current.studySessions,
-      }));
-      if (backup.dashboardPrefs && typeof backup.dashboardPrefs === "object") setDashboardPrefs(backup.dashboardPrefs);
-      if (backup.flashcardReviews && typeof backup.flashcardReviews === "object") setFlashcardReviews(backup.flashcardReviews);
-      notify("Planner backup imported and syncing.");
-    } catch (error) {
-      notify(error.message || "Could not import that backup.");
-    }
-  };
-
   const recordStudySession = (minutes, type = "Focus") => {
     const amount = Math.round(Number(minutes));
     if (!Number.isFinite(amount) || amount <= 0) return;
@@ -5508,8 +5493,6 @@ function App() {
       }}
       setPreferences={setDashboardPrefs}
       onRecordStudy={recordStudySession}
-      onExport={exportPlanner}
-      onImport={importPlanner}
     />;
   } else if (page === "subjects") {
     view = <Subjects subjects={data.subjects} setSubjects={(val) => updateData("subjects", val)} tasks={data.tasks} notify={notify} />;

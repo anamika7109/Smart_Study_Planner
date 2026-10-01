@@ -51,6 +51,41 @@ test("planner and notes API persists a private study workflow", async () => {
   assert.deepEqual(created.body.note.tags, ["api", "test"]);
 
   const noteId = created.body.note._id;
+  const guestId = guest.body.account.id;
+  const email = `notes-${Date.now()}@example.test`;
+  const password = "PersistentNotes!123";
+  const registered = await request("/api/auth/register", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      email,
+      password,
+      name: "API Test Student",
+      studentClass: "Year 1",
+      course: "Test Course",
+    }),
+  });
+  assert.equal(registered.response.status, 200);
+  assert.equal(registered.body.account.id, guestId);
+
+  const notesAfterRegistration = await request("/api/notes");
+  assert.ok(notesAfterRegistration.body.notes.some((note) => note._id === noteId));
+
+  const signedOut = await request("/api/auth/logout", { method: "POST" });
+  assert.equal(signedOut.response.status, 200);
+
+  const signedIn = await request("/api/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  assert.equal(signedIn.response.status, 200);
+  assert.equal(signedIn.body.account.id, guestId);
+
+  const notesAfterLogin = await request("/api/notes");
+  assert.equal(notesAfterLogin.response.status, 200);
+  assert.ok(notesAfterLogin.body.notes.some((note) => note._id === noteId));
+
   const updated = await request(`/api/notes/${noteId}`, {
     method: "PUT",
     headers: { "content-type": "application/json" },
@@ -71,4 +106,8 @@ test("planner and notes API persists a private study workflow", async () => {
 
   const deleted = await request(`/api/notes/${noteId}`, { method: "DELETE" });
   assert.equal(deleted.response.status, 200);
+
+  const notesAfterDelete = await request("/api/notes");
+  assert.equal(notesAfterDelete.response.status, 200);
+  assert.ok(!notesAfterDelete.body.notes.some((note) => note._id === noteId));
 });
