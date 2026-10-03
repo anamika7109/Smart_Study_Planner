@@ -1,6 +1,8 @@
 const express = require("express");
 const dotenv = require("dotenv");
 const mongoose = require("mongoose");
+const fs = require("node:fs");
+const os = require("node:os");
 const path = require("path");
 const crypto = require("crypto");
 const { promisify } = require("util");
@@ -18,6 +20,80 @@ const SESSION_SECRET = process.env.SESSION_SECRET ||
   (process.env.NODE_ENV === "production" ? "" : "studyflow-development-only-change-before-deploy");
 const SESSION_COOKIE_NAME = "studyflow.sid";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 365;
+const LOCAL_DATA_DIR = process.env.STUDYFLOW_LOCAL_DATA_DIR ||
+  (process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "StudyFlow") : path.join(os.homedir(), ".studyflow"));
+const LOCAL_DATA_FILE = path.join(LOCAL_DATA_DIR, "planner-store.json");
+
+function loadLocalState() {
+  try {
+    const saved = JSON.parse(fs.readFileSync(LOCAL_DATA_FILE, "utf8"));
+    return {
+      users: Array.isArray(saved.users) ? saved.users : [],
+      notes: Array.isArray(saved.notes) ? saved.notes : [],
+      sessions: saved.sessions && typeof saved.sessions === "object" ? saved.sessions : {},
+    };
+  } catch (error) {
+    if (error.code !== "ENOENT") console.warn("Could not read local StudyFlow data:", error.message);
+    return { users: [], notes: [], sessions: {} };
+  }
+}
+
+const localState = loadLocalState();
+
+function persistLocalState() {
+  fs.mkdirSync(LOCAL_DATA_DIR, { recursive: true, mode: 0o700 });
+  const tempFile = `${LOCAL_DATA_FILE}.${process.pid}.tmp`;
+  fs.writeFileSync(tempFile, JSON.stringify(localState), { encoding: "utf8", mode: 0o600 });
+  fs.renameSync(tempFile, LOCAL_DATA_FILE);
+}
+
+class LocalFileSessionStore extends session.Store {
+  get(sessionId, callback) {
+    const savedSession = localState.sessions[sessionId];
+    if (!savedSession) return callback(null, null);
+
+    const storageMode = mongoose.connection.readyState === 1 ? "mongo" : "local";
+    const expiresAt = savedSession.cookie?.expires ? new Date(savedSession.cookie.expires).getTime() : null;
+    if ((savedSession.__storageMode && savedSession.__storageMode !== storageMode) ||
+        (Number.isFinite(expiresAt) && expiresAt <= Date.now())) {
+      delete localState.sessions[sessionId];
+      try {
+        persistLocalState();
+        return callback(null, null);
+      } catch (error) {
+        return callback(error);
+      }
+    }
+    callback(null, savedSession);
+  }
+
+  set(sessionId, value, callback = () => {}) {
+    const storageMode = mongoose.connection.readyState === 1 ? "mongo" : "local";
+    localState.sessions[sessionId] = { ...value, __storageMode: storageMode };
+    try {
+      persistLocalState();
+      callback(null);
+    } catch (error) {
+      callback(error);
+    }
+  }
+
+  touch(sessionId, value, callback = () => {}) {
+    if (!localState.sessions[sessionId]) return callback(null);
+    this.set(sessionId, value, callback);
+  }
+
+  destroy(sessionId, callback = () => {}) {
+    delete localState.sessions[sessionId];
+    try {
+      persistLocalState();
+      callback(null);
+    } catch (error) {
+      callback(error);
+    }
+  }
+}
+
 if (!SESSION_SECRET) {
   throw new Error("SESSION_SECRET must be configured in production.");
 }
@@ -54,7 +130,7 @@ const sessionOptions = {
   },
 };
 
-if (MONGODB_URI) {
+if (MONGODB_URI && process.env.NODE_ENV === "production") {
   sessionOptions.store = MongoStore.create({
     mongoUrl: MONGODB_URI,
     collectionName: "studyflow_sessions",
@@ -63,7 +139,8 @@ if (MONGODB_URI) {
 } else if (process.env.NODE_ENV === "production") {
   throw new Error("MONGODB_URI is required in production.");
 } else {
-  console.warn("MONGODB_URI should be configured before deployment.");
+  sessionOptions.store = new LocalFileSessionStore();
+  console.warn(`Development planner data and sessions persist locally at ${LOCAL_DATA_FILE}.`);
 }
 
 app.use(session(sessionOptions));
@@ -119,7 +196,7 @@ const initialPlannerState = () => ({
     lastStudyDate: "",
     onboardingComplete: false,
   },
-  data: { subjects: [], tasks: [], exams: [], studySessions: [] },
+  data: { subjects: [], tasks: [], exams: [], studySessions: [], activityLog: [] },
   dashboardPrefs: {
     stats: ["streak", "today", "tasks", "subjects"],
     sections: { tasks: true, exams: true, subjects: true },
@@ -150,7 +227,7 @@ const normalizeMemoryUser = (user) => {
   const profile = cleanProfile(base.profile || base.planner?.profile, base.email ? base.email.split("@")[0] || "Student" : "Student");
   const planner = base.planner && typeof base.planner === "object"
     ? cleanPlannerState(base.planner, profile)
-    : { profile, data: { subjects: [], tasks: [], exams: [], studySessions: [] }, dashboardPrefs: { stats: ["streak", "today", "tasks", "subjects"], sections: { tasks: true, exams: true, subjects: true } }, flashcardReviews: {} };
+    : { profile, data: { subjects: [], tasks: [], exams: [], studySessions: [], activityLog: [] }, dashboardPrefs: { stats: ["streak", "today", "tasks", "subjects"], sections: { tasks: true, exams: true, subjects: true } }, flashcardReviews: {} };
 
   return {
     ...base,
@@ -170,6 +247,8 @@ const normalizeMemoryUser = (user) => {
 const saveMemoryUser = (user) => {
   const normalized = normalizeMemoryUser(user);
   memoryUsers.set(String(normalized._id), normalized);
+  localState.users = Array.from(memoryUsers.values());
+  persistLocalState();
   return normalized;
 };
 
@@ -210,6 +289,14 @@ const cleanPlannerState = (input, profile) => {
     tasks: Array.isArray(sourceData.tasks) ? sourceData.tasks.filter((item) => item && typeof item === "object").slice(0, 1000) : [],
     exams: Array.isArray(sourceData.exams) ? sourceData.exams.filter((item) => item && typeof item === "object").slice(0, 500) : [],
     studySessions: Array.isArray(sourceData.studySessions) ? sourceData.studySessions.filter((item) => item && typeof item === "object").slice(-5000) : [],
+    activityLog: Array.isArray(sourceData.activityLog) ? sourceData.activityLog.filter((item) => item && typeof item === "object").slice(0, 5000).map((item) => ({
+      id: typeof item.id === "string" ? item.id.slice(0, 120) : "",
+      kind: typeof item.kind === "string" ? item.kind.slice(0, 40) : "activity",
+      title: typeof item.title === "string" ? item.title.slice(0, 300) : "Activity",
+      details: typeof item.details === "string" ? item.details.slice(0, 500) : "",
+      entityId: typeof item.entityId === "string" ? item.entityId.slice(0, 120) : "",
+      createdAt: typeof item.createdAt === "string" ? item.createdAt.slice(0, 40) : new Date().toISOString(),
+    })) : [],
   };
   const preferences = source.dashboardPrefs && typeof source.dashboardPrefs === "object" ? source.dashboardPrefs : {};
   const sections = preferences.sections && typeof preferences.sections === "object" ? preferences.sections : {};
@@ -241,6 +328,14 @@ const cleanPlannerState = (input, profile) => {
   };
 };
 
+for (const savedUser of localState.users) {
+  const user = normalizeMemoryUser(savedUser);
+  memoryUsers.set(String(user._id), user);
+}
+for (const note of localState.notes) {
+  if (note && typeof note === "object" && note._id) memoryNotes.set(String(note._id), note);
+}
+
 const sendAccount = (res, user, extra = {}) => {
   res.json({
     success: true,
@@ -270,6 +365,7 @@ const requireDatabase = (req, res, next) => {
     "/api/auth/guest",
     "/api/auth/register",
     "/api/auth/recover",
+    "/api/auth/recovery-code",
     "/api/auth/login",
     "/api/auth/logout",
     "/api/auth/me",
@@ -436,18 +532,23 @@ app.post("/api/auth/register", requireDatabase, limitAccountAuth, async (req, re
       if (existing) {
         return res.status(409).json({ success: false, error: "An account with this email already exists. Please log in." });
       }
+      const currentUser = req.session?.userId ? getMemoryUserById(req.session.userId) : null;
+      if (currentUser && !currentUser.isGuest) {
+        return res.status(409).json({ success: false, error: "Sign out before creating a different account." });
+      }
       const hashedPassword = await passwordHash(password);
       const recoveryCode = createRecoveryCode();
       const hashedRecoveryCode = await passwordHash(recoveryCode);
-      const profile = cleanProfile({ ...initialPlannerState().profile, ...studentDetails, onboardingComplete: true }, studentDetails.name || "Student");
-      const planner = cleanPlannerState(initialPlannerState(), profile);
+      const profile = cleanProfile({ ...currentUser?.profile, ...studentDetails, onboardingComplete: true }, studentDetails.name || "Student");
+      const planner = cleanPlannerState(currentUser?.planner || initialPlannerState(), profile);
       const user = saveMemoryUser({
-        _id: createMemoryId(),
+        ...currentUser,
+        _id: currentUser?._id || createMemoryId(),
         email,
         isGuest: false,
         passwordHash: hashedPassword,
         recoveryCodeHash: hashedRecoveryCode,
-        sessionVersion: 0,
+        sessionVersion: currentUser?.sessionVersion || 0,
         profile,
         planner,
       });
@@ -614,7 +715,7 @@ app.get("/api/health", (req, res) => {
   const databaseReady = mongoose.connection.readyState === 1;
   return res.status(200).json({
     success: true,
-    database: databaseReady ? "connected" : "local-memory",
+    database: databaseReady ? "connected" : "local-disk",
     aiConfigured: Boolean(GEMINI_API_KEY),
   });
 });
@@ -901,6 +1002,8 @@ app.post("/api/notes", requireDatabase, requireAuth, async (req, res) => {
         updatedAt: new Date().toISOString(),
       };
       memoryNotes.set(note._id, note);
+      localState.notes = Array.from(memoryNotes.values());
+      persistLocalState();
       return res.status(201).json({ success: true, note });
     }
 
@@ -976,6 +1079,8 @@ app.put("/api/notes/:id", requireDatabase, requireAuth, async (req, res) => {
         updatedAt: new Date().toISOString(),
       };
       memoryNotes.set(id, updatedNote);
+      localState.notes = Array.from(memoryNotes.values());
+      persistLocalState();
       return res.json({ success: true, note: updatedNote });
     }
 
@@ -1066,6 +1171,8 @@ app.delete("/api/notes/:id", requireDatabase, requireAuth, async (req, res) => {
         });
       }
       memoryNotes.delete(id);
+      localState.notes = Array.from(memoryNotes.values());
+      persistLocalState();
       return res.json({
         success: true,
         message: "Note deleted successfully.",
@@ -1123,19 +1230,23 @@ app.get("/{*path}", (req, res) => {
 // --------------------------------------------------
 
 async function startServer() {
+  let databaseConnected = false;
   if (MONGODB_URI) {
-    mongoose
-      .connect(MONGODB_URI)
-      .then(async () => {
-        await User.collection.updateMany(
-          {},
+    try {
+      await mongoose.connect(MONGODB_URI, { serverSelectionTimeoutMS: 5000 });
+      await User.collection.updateMany(
+        {},
         { $unset: { passwordResetTokenHash: "", passwordResetExpiresAt: "" } }
-        );
+      );
+      databaseConnected = true;
       console.log("MongoDB connected successfully.");
-      })
-      .catch((error) => console.error("MongoDB connection failed; AI endpoints remain available:", error.message));
+    } catch (error) {
+      console.error("MongoDB connection failed:", error.message);
+      if (process.env.NODE_ENV === "production") throw error;
+      console.warn("Starting the development backend with local in-memory planner storage.");
+    }
   } else {
-    console.warn("MONGODB_URI is not configured. AI endpoints are available; note storage is disabled.");
+    console.warn("MONGODB_URI is not configured. Starting with local in-memory planner storage.");
   }
 
   app.listen(PORT, () => {
@@ -1146,7 +1257,7 @@ async function startServer() {
     console.log(`Server running on: http://localhost:${PORT}`);
     console.log(`Gemini configured: ${Boolean(GEMINI_API_KEY)}`);
     console.log(`Gemini model: ${GEMINI_MODEL}`);
-    console.log(`MongoDB configured: ${Boolean(MONGODB_URI)}`);
+    console.log(`Planner storage: ${databaseConnected ? "MongoDB" : "local disk"}`);
     console.log("Planner access: email and password accounts");
     console.log("====================================");
     console.log("");

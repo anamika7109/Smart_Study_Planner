@@ -12,6 +12,7 @@ const initialData = {
   tasks: [],
   exams: [],
   studySessions: [],
+  activityLog: [],
 };
 
 const initialProfile = {
@@ -247,6 +248,22 @@ function getMinutesForDate(sessions, key) {
 function getSessionTypeLabel(session) {
   const value = typeof session?.type === "string" ? session.type.trim() : "";
   return value || "Focus";
+}
+
+const activityCategories = [
+  { name: "Focus", icon: "◉", color: "#38bdf8" },
+  { name: "Revision", icon: "↻", color: "#a78bfa" },
+  { name: "Reading", icon: "▤", color: "#34d399" },
+  { name: "Practice", icon: "✎", color: "#fbbf24" },
+  { name: "Deep work", icon: "◈", color: "#fb7185" },
+];
+
+function getActivityCategoryInfo(category) {
+  return activityCategories.find((item) => item.name.toLowerCase() === String(category || "").toLowerCase()) || {
+    name: category || "Activity",
+    icon: "•",
+    color: "#94a3b8",
+  };
 }
 
 function getWeekData(sessions) {
@@ -1679,26 +1696,6 @@ body { font-size: 15px; line-height: 1.6; }
   font-size: 13px;
   font-weight: 600;
 }
-.welcome .backend-status {
-  display: inline-flex;
-  align-items: center;
-  gap: 9px;
-  margin-top: 16px;
-  padding: 10px 13px;
-  border: 1px solid rgba(202, 190, 255, .18);
-  border-radius: 99px;
-  background: rgba(22, 22, 36, .72);
-  color: #d7d8e3;
-  font: inherit;
-  font-size: 13px;
-  cursor: pointer;
-  transition: border-color .2s ease, background .2s ease;
-}
-.welcome .backend-status:hover { border-color: rgba(var(--theme-rgb), .5); background: rgba(var(--theme-rgb), .08); }
-.welcome .backend-status-dot { width: 8px; height: 8px; border-radius: 50%; background: #fbbf24; }
-.welcome .backend-status.ready .backend-status-dot { background: #34d399; box-shadow: 0 0 10px rgba(52, 211, 153, .55); }
-.welcome .backend-status.ai-unconfigured .backend-status-dot { background: #fbbf24; }
-.welcome .backend-status.offline .backend-status-dot { background: #fb7185; }
 .welcome .welcome-footer { color: #a7aaba; font-size: 12px; }
 .welcome .welcome-footer span:last-child { color: #c4c7d4; }
 .welcome-preview .preview-brand { color: #fbfaff; font-size: 14px; }
@@ -1901,11 +1898,18 @@ body { font-size: 15px; line-height: 1.6; }
 .sf-app.light .progress-range button:hover { color: #252b3c; background: rgba(44,52,78,.07); }
 .sf-app.light .progress-range button.active { color: #252039; }
 .sf-app.light .progress-trend { color: #343b50; border-color: rgba(44,52,78,.1); background: rgba(255,255,255,.48); }
+.history-entry { display: flex; align-items: flex-start; gap: 13px; }
+.history-icon { display: grid; place-items: center; flex: 0 0 38px; width: 38px; height: 38px; border: 1px solid color-mix(in srgb, var(--history-color) 40%, transparent); border-radius: 12px; background: color-mix(in srgb, var(--history-color) 14%, transparent); color: var(--history-color); font-size: 18px; font-weight: 800; }
+.history-entry-copy { display: grid; flex: 1; gap: 5px; min-width: 0; }
+.history-kind { display: inline-flex; align-items: center; border-radius: 99px; padding: 4px 8px; color: var(--history-color); background: color-mix(in srgb, var(--history-color) 12%, transparent); font-size: 11px; font-weight: 700; }
+.history-date { color: #8993aa; font-size: 12px; }
+.sf-app.light .history-date { color: #68738a; }
 @media(max-width: 640px) {
   .sf-app .progress-overview-heading { align-items: flex-start; flex-direction: column; }
   .sf-app .progress-range { width: 100%; }
   .sf-app .progress-range button { flex: 1; }
   .sf-app .progress-trend { align-items: flex-start; }
+  .history-entry { gap: 10px; }
 }
 `;
 
@@ -1986,6 +1990,7 @@ function Layout({ children, page, navigate, dark, setDark, syncStatus, retrySync
     ["flashcards", "▣", "Flashcards"],
     ["schedule", "◷", "Schedule"],
     ["progress", "◔", "Progress"],
+    ["history", "◷", "History"],
     ["reminders", "!", "Reminders"],
     ["ai", "✦", "AI Assistant"],
   ];
@@ -2070,42 +2075,6 @@ function Layout({ children, page, navigate, dark, setDark, syncStatus, retrySync
 
 function Welcome({ onLogin, onRegister, theme, setTheme }) {
   const [preview, setPreview] = useState(0);
-  const [backendStatus, setBackendStatus] = useState("checking");
-  const loadBackendStatus = useCallback(async () => {
-    const response = await fetch("/api/health", {
-      cache: "no-store",
-      signal: AbortSignal.timeout(8000),
-    });
-    const health = await response.json();
-    if (!response.ok || !health.success || health.database !== "connected") {
-      throw new Error("StudyFlow backend is unavailable.");
-    }
-    return health.aiConfigured ? "ready" : "ai-unconfigured";
-  }, []);
-
-  const checkBackend = async () => {
-    setBackendStatus("checking");
-    try {
-      setBackendStatus(await loadBackendStatus());
-    } catch {
-      setBackendStatus("offline");
-    }
-  };
-
-  useEffect(() => {
-    let active = true;
-    loadBackendStatus()
-      .then((status) => {
-        if (active) setBackendStatus(status);
-      })
-      .catch(() => {
-        if (active) setBackendStatus("offline");
-      });
-    return () => {
-      active = false;
-    };
-  }, [loadBackendStatus]);
-
   const previews = [
     {
       label: "This week",
@@ -2166,21 +2135,6 @@ function Welcome({ onLogin, onRegister, theme, setTheme }) {
             <span className="pill">◷ Focus sessions</span>
             <span className="pill">▤ Notes & flashcards</span>
           </div>
-          <button
-            className={`backend-status ${backendStatus}`}
-            type="button"
-            onClick={checkBackend}
-            aria-live="polite"
-          >
-            <span className="backend-status-dot" aria-hidden="true" />
-            {backendStatus === "checking"
-              ? "Checking backend…"
-              : backendStatus === "ready"
-              ? "Backend and AI are ready"
-              : backendStatus === "ai-unconfigured"
-              ? "Backend connected · AI setup needed"
-              : "Backend unavailable · Tap to retry"}
-          </button>
         </section>
 
         <section className="welcome-preview" aria-label="Interactive StudyFlow planner preview">
@@ -2545,6 +2499,7 @@ function Dashboard({
   preferences,
   setPreferences,
   onRecordStudy,
+  onActivity,
 }) {
   const [timeGreeting, setTimeGreeting] = useState(getIndiaTimeGreeting);
   const [quoteIndex, setQuoteIndex] = useState(() => new Date().getDate() % motivationalQuotes.length);
@@ -2804,6 +2759,7 @@ function Dashboard({
                         className="check dashboard-toggle"
                         aria-label={`Mark ${task.title} complete`}
                         onClick={() => {
+                          onActivity("task_completed", `Completed task: ${task.title}`, subjects.find((item) => item.id === task.subjectId)?.name || "", task.id);
                           setTasks((current) => current.map((item) =>
                             item.id === task.id ? { ...item, done: true, completedAt: new Date().toISOString() } : item
                           ));
@@ -3115,7 +3071,7 @@ function Subjects({ subjects, setSubjects, tasks, notify }) {
    TASKS
 ----------------------------------------------------------- */
 
-function Tasks({ tasks, setTasks, subjects, notify }) {
+function Tasks({ tasks, setTasks, subjects, notify, onActivity }) {
   const [title, setTitle] = useState("");
   const [subjectId, setSubjectId] = useState("");
   const [due, setDue] = useState("");
@@ -3154,6 +3110,7 @@ function Tasks({ tasks, setTasks, subjects, notify }) {
     };
 
     setTasks((current) => [...current, newTask]);
+    onActivity("task_created", `Added task: ${newTask.title}`, subjects.find((subject) => subject.id === newTask.subjectId)?.name || "", newTask.id);
     setTitle("");
     setDue("");
     setPriority("Medium");
@@ -3162,6 +3119,11 @@ function Tasks({ tasks, setTasks, subjects, notify }) {
 
   const toggleTask = (id) => {
     const task = tasks.find((item) => item.id === id);
+    if (task && !task.done) {
+      onActivity("task_completed", `Completed task: ${task.title}`, subjects.find((subject) => subject.id === task.subjectId)?.name || "", task.id);
+    } else if (task?.done) {
+      onActivity("task_reopened", `Reopened task: ${task.title}`, subjects.find((subject) => subject.id === task.subjectId)?.name || "", task.id);
+    }
     setAnimatingTaskId(task && !task.done ? id : null);
     setTasks((current) =>
       current.map((task) =>
@@ -3173,6 +3135,8 @@ function Tasks({ tasks, setTasks, subjects, notify }) {
   };
 
   const deleteTask = (id) => {
+    const task = tasks.find((item) => item.id === id);
+    if (task) onActivity("task_deleted", `Deleted task: ${task.title}`, subjects.find((subject) => subject.id === task.subjectId)?.name || "", task.id);
     setTasks((current) => current.filter((task) => task.id !== id));
     notify("Task deleted");
   };
@@ -3368,6 +3332,53 @@ function Progress({ profile, setProfile, tasks, subjects, studySessions, notify,
     [studySessions, rangeDays]
   );
   const periodBuckets = useMemo(() => getStudyPeriodBuckets(periodDays, goal), [periodDays, goal]);
+  const categoryTotals = useMemo(() => {
+    const periodKeys = new Set(periodDays.map((day) => day.key));
+    return activityCategories.map((category) => {
+      const sessions = studySessions.filter((session) =>
+        periodKeys.has(session.date) && getSessionTypeLabel(session).toLowerCase() === category.name.toLowerCase()
+      );
+      return {
+        ...category,
+        minutes: sessions.reduce((sum, session) => sum + (Number(session.minutes) || 0), 0),
+        count: sessions.length,
+      };
+    });
+  }, [periodDays, studySessions]);
+  const totalStudyMinutes = studySessions.reduce((sum, session) => sum + (Number(session.minutes) || 0), 0);
+  const averageSessionMinutes = studySessions.length ? Math.round(totalStudyMinutes / studySessions.length) : 0;
+  const peakStudyWindow = useMemo(() => {
+    const windows = [
+      { name: "Morning", range: "5 am–11 am", minutes: 0 },
+      { name: "Afternoon", range: "12 pm–4 pm", minutes: 0 },
+      { name: "Evening", range: "5 pm–8 pm", minutes: 0 },
+      { name: "Night", range: "9 pm–4 am", minutes: 0 },
+    ];
+    studySessions.forEach((session) => {
+      if (!session.createdAt) return;
+      const date = new Date(session.createdAt);
+      if (Number.isNaN(date.getTime())) return;
+      const hour = date.getHours();
+      const windowIndex = hour >= 5 && hour < 12 ? 0 : hour < 17 && hour >= 12 ? 1 : hour < 21 && hour >= 17 ? 2 : 3;
+      windows[windowIndex].minutes += Number(session.minutes) || 0;
+    });
+    return windows.reduce((best, window) => window.minutes > best.minutes ? window : best, windows[0]);
+  }, [studySessions]);
+  const strongestDay = periodDays.reduce((best, day) => day.total > best.total ? day : best, periodDays[0]);
+  const strongestCategory = categoryTotals.reduce((best, category) => category.minutes > best.minutes ? category : best, categoryTotals[0]);
+  const completedGoalDays = Object.values(studySessions.reduce((days, session) => {
+    days[session.date] = (days[session.date] || 0) + (Number(session.minutes) || 0);
+    return days;
+  }, {})).filter((minutesForDay) => minutesForDay >= goal).length;
+  const achievementBadges = [
+    { title: "First session", icon: "✦", description: "Log a study session", progress: Math.min(studySessions.length, 1), target: 1, color: "#38bdf8" },
+    { title: "Study hour", icon: "◷", description: "Log 60 study minutes", progress: Math.min(totalStudyMinutes, 60), target: 60, color: "#a78bfa" },
+    { title: "Three-day streak", icon: "🔥", description: "Study three days in a row", progress: Math.min(streak, 3), target: 3, color: "#fb7185" },
+    { title: "Task finisher", icon: "✓", description: "Complete 10 tasks", progress: Math.min(completed, 10), target: 10, color: "#34d399" },
+    { title: "Daily goal", icon: "◎", description: "Reach your daily goal 5 times", progress: Math.min(completedGoalDays, 5), target: 5, color: "#fbbf24" },
+    { title: "Explore every mode", icon: "◇", description: "Try all five study modes", progress: Math.min(new Set(studySessions.map((session) => getSessionTypeLabel(session).toLowerCase())).size, 5), target: 5, color: "#c084fc" },
+  ].map((badge) => ({ ...badge, earned: badge.progress >= badge.target }));
+  const hasTimeInsights = studySessions.some((session) => session.createdAt && !Number.isNaN(new Date(session.createdAt).getTime()));
   const periodTotal = periodDays.reduce((sum, day) => sum + day.total, 0);
   const previousPeriodTotal = previousPeriodDays.reduce((sum, day) => sum + day.total, 0);
   const periodAverage = Math.round(periodTotal / rangeDays);
@@ -3544,6 +3555,83 @@ function Progress({ profile, setProfile, tasks, subjects, studySessions, notify,
         <WeekBars data={periodBuckets} goal={goal} tall periodDays={rangeDays} />
       </section>
 
+      <section className="panel" aria-label="Study time by category" style={{ marginTop: 16 }}>
+        <div className="row" style={{ marginBottom: 14 }}>
+          <h2 className="card-title" style={{ margin: 0 }}>Study by category</h2>
+          <span className="tag">Last {rangeDays} days</span>
+        </div>
+        <div className="grid three">
+          {categoryTotals.map((category) => (
+            <div className="item" key={category.name}>
+              <div className="row">
+                <div className="row" style={{ justifyContent: "flex-start" }}>
+                  <span className="history-icon" style={{ "--history-color": category.color, width: 34, height: 34, flexBasis: 34, borderRadius: 10 }} aria-hidden="true">{category.icon}</span>
+                  <b>{category.name}</b>
+                </div>
+                <b>{category.minutes} min</b>
+              </div>
+              <div className="progress" style={{ marginTop: 10 }}>
+                <div className="bar" style={{ width: `${periodTotal ? Math.round((category.minutes / periodTotal) * 100) : 0}%`, background: category.color }} />
+              </div>
+              <div className="muted" style={{ marginTop: 7, fontSize: 12 }}>{category.count} {category.count === 1 ? "session" : "sessions"}</div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="grid two" aria-label="Achievements and focus insights" style={{ marginTop: 16 }}>
+        <div className="panel">
+          <div className="row" style={{ marginBottom: 14 }}>
+            <div>
+              <div className="eyebrow">Milestones</div>
+              <h2 className="card-title" style={{ margin: "3px 0 0" }}>Achievement badges</h2>
+            </div>
+            <span className="tag">{achievementBadges.filter((badge) => badge.earned).length}/{achievementBadges.length} earned</span>
+          </div>
+          <div className="grid two">
+            {achievementBadges.map((badge) => (
+              <div className="item" key={badge.title} style={{ opacity: badge.earned ? 1 : 0.72 }}>
+                <div className="row" style={{ justifyContent: "flex-start", alignItems: "flex-start" }}>
+                  <span className="history-icon" style={{ "--history-color": badge.color, filter: badge.earned ? "none" : "grayscale(1)" }} aria-hidden="true">{badge.icon}</span>
+                  <div style={{ minWidth: 0 }}>
+                    <b>{badge.title}</b>
+                    <div className="muted" style={{ fontSize: 12 }}>{badge.earned ? "Unlocked" : badge.description}</div>
+                  </div>
+                </div>
+                <div className="progress" style={{ marginTop: 10 }}>
+                  <div className="bar" style={{ width: `${Math.round((badge.progress / badge.target) * 100)}%`, background: badge.color }} />
+                </div>
+                <div className="muted" style={{ marginTop: 6, fontSize: 11 }}>{badge.progress}/{badge.target}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="panel">
+          <div className="eyebrow">Your patterns</div>
+          <h2 className="card-title" style={{ margin: "3px 0 14px" }}>Focus insights</h2>
+          <div className="list">
+            <div className="item row">
+              <div><div className="muted">Peak study window</div><b>{hasTimeInsights ? peakStudyWindow.name : "Not enough data yet"}</b></div>
+              <span className="tag">{hasTimeInsights ? peakStudyWindow.range : "Log a timed session"}</span>
+            </div>
+            <div className="item row">
+              <div><div className="muted">Most-used study mode</div><b>{strongestCategory?.minutes ? strongestCategory.name : "No mode yet"}</b></div>
+              <span className="tag">{strongestCategory?.minutes || 0} min</span>
+            </div>
+            <div className="item row">
+              <div><div className="muted">Average session</div><b>{averageSessionMinutes ? `${averageSessionMinutes} min` : "No sessions yet"}</b></div>
+              <span className="tag">{studySessions.length} total</span>
+            </div>
+            <div className="item row">
+              <div><div className="muted">Strongest day · last {rangeDays} days</div><b>{strongestDay?.total ? strongestDay.label : "No study time yet"}</b></div>
+              <span className="tag">{strongestDay?.total || 0} min</span>
+            </div>
+          </div>
+          <p className="muted" style={{ fontSize: 12, margin: "12px 0 0" }}>Insights are based on your recorded study sessions.</p>
+        </div>
+      </section>
+
       <div className="panel" style={{ marginTop: 16 }}>
         <h2 className="card-title">Recent study sessions</h2>
         <div className="list">
@@ -3595,6 +3683,113 @@ function Progress({ profile, setProfile, tasks, subjects, studySessions, notify,
           </div>
         )}
       </div>
+    </>
+  );
+}
+
+const historyKinds = {
+  ...Object.fromEntries(activityCategories.map(({ name, icon, color }) => [name, { label: name, icon, color, group: "study" }])),
+  task_created: { label: "Task added", icon: "+", color: "#60a5fa", group: "tasks" },
+  task_completed: { label: "Task completed", icon: "✓", color: "#34d399", group: "tasks" },
+  task_reopened: { label: "Task reopened", icon: "↶", color: "#fbbf24", group: "tasks" },
+  task_deleted: { label: "Task deleted", icon: "×", color: "#fb7185", group: "tasks" },
+  ai_chat: { label: "AI chat", icon: "✦", color: "#c084fc", group: "ai" },
+  ai_quiz: { label: "Quiz created", icon: "▦", color: "#f97316", group: "ai" },
+  quiz_completed: { label: "Quiz completed", icon: "✓", color: "#f97316", group: "ai" },
+};
+
+function History({ activityLog = [], studySessions = [], tasks = [] }) {
+  const [filter, setFilter] = useState("all");
+  const [search, setSearch] = useState("");
+  const entries = useMemo(() => {
+    const activities = (Array.isArray(activityLog) ? activityLog : []).map((event) => ({
+      ...event,
+      group: historyKinds[event.kind]?.group || "other",
+    }));
+    const loggedTaskEvents = new Set(activities.filter((event) => event.entityId).map((event) => `${event.entityId}:${event.kind}`));
+    const legacyTaskEvents = (Array.isArray(tasks) ? tasks : []).flatMap((task) => {
+      const events = [];
+      if (task.createdAt && !loggedTaskEvents.has(`${task.id}:task_created`)) {
+        events.push({ id: `legacy-created-${task.id}`, kind: "task_created", group: "tasks", title: `Added task: ${task.title}`, details: "", createdAt: task.createdAt });
+      }
+      if (task.completedAt && !loggedTaskEvents.has(`${task.id}:task_completed`)) {
+        events.push({ id: `legacy-completed-${task.id}`, kind: "task_completed", group: "tasks", title: `Completed task: ${task.title}`, details: "", createdAt: task.completedAt });
+      }
+      return events;
+    });
+    const sessions = (Array.isArray(studySessions) ? studySessions : []).map((session) => {
+      const type = getSessionTypeLabel(session);
+      return {
+        id: `session-${session.id || `${session.date}-${session.minutes}-${session.createdAt || ""}`}`,
+        kind: type,
+        group: "study",
+        title: `${type} study session`,
+        details: `${Number(session.minutes) || 0} minutes${session.subject ? ` · ${session.subject}` : ""}`,
+        createdAt: session.createdAt || session.date,
+      };
+    });
+    return [...activities, ...legacyTaskEvents, ...sessions].sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+  }, [activityLog, studySessions, tasks]);
+
+  const visibleEntries = entries.filter((entry) => {
+    const matchesFilter = filter === "all" || entry.group === filter;
+    const text = `${entry.title || ""} ${entry.details || ""} ${entry.kind || ""}`.toLowerCase();
+    return matchesFilter && text.includes(search.trim().toLowerCase());
+  });
+  const totalStudyMinutes = studySessions.reduce((total, session) => total + (Number(session.minutes) || 0), 0);
+  const filterOptions = [["all", "All activity"], ["study", "Study time"], ["tasks", "Tasks"], ["ai", "AI & quizzes"]];
+
+  return (
+    <>
+      <div className="page-head">
+        <div>
+          <div className="eyebrow">Your activity</div>
+          <h1 className="title">History</h1>
+          <div className="muted">A saved record of your study sessions and completed work.</div>
+        </div>
+      </div>
+
+      <div className="grid three" style={{ marginBottom: 16 }}>
+        <div className="panel"><div className="muted">Recorded actions</div><div className="stat-value">{entries.length}</div></div>
+        <div className="panel"><div className="muted">Study sessions</div><div className="stat-value">{studySessions.length}</div></div>
+        <div className="panel"><div className="muted">Study time logged</div><div className="stat-value">{Math.floor(totalStudyMinutes / 60)}h {totalStudyMinutes % 60}m</div></div>
+      </div>
+
+      <section className="panel" aria-label="Activity history">
+        <div className="row" style={{ marginBottom: 14, flexWrap: "wrap" }}>
+          <div className="filter-row" role="group" aria-label="Filter history">
+            {filterOptions.map(([id, label]) => (
+              <button key={id} type="button" className={`filter-btn ${filter === id ? "active" : ""}`} aria-pressed={filter === id} onClick={() => setFilter(id)}>{label}</button>
+            ))}
+          </div>
+          <input value={search} onChange={(event) => setSearch(event.target.value)} aria-label="Search activity history" placeholder="Search history" style={{ maxWidth: 260 }} />
+        </div>
+
+        <div className="list">
+          {visibleEntries.map((entry) => {
+            const info = historyKinds[entry.kind] || getActivityCategoryInfo(entry.kind);
+            const infoLabel = info.label || info.name;
+            const date = new Date(entry.createdAt || "");
+            const dateLabel = Number.isNaN(date.getTime())
+              ? "Date unavailable"
+              : date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+            return (
+              <article className="item history-entry" key={`${entry.kind}-${entry.id || entry.createdAt}-${entry.title}`}>
+                <span className="history-icon" style={{ "--history-color": info.color }} aria-hidden="true">{info.icon}</span>
+                <div className="history-entry-copy">
+                  <div className="row" style={{ justifyContent: "flex-start", flexWrap: "wrap" }}>
+                    <b>{entry.title || infoLabel}</b>
+                    <span className="history-kind" style={{ "--history-color": info.color }}>{infoLabel}</span>
+                  </div>
+                  {entry.details && <div className="muted">{entry.details}</div>}
+                  <time className="history-date" dateTime={Number.isNaN(date.getTime()) ? undefined : date.toISOString()}>{dateLabel}</time>
+                </div>
+              </article>
+            );
+          })}
+          {!visibleEntries.length && <div className="empty">{entries.length ? "No history matches this filter." : "Your activity will appear here as you study, complete tasks, and use the AI assistant."}</div>}
+        </div>
+      </section>
     </>
   );
 }
@@ -4166,7 +4361,7 @@ function Flashcards({ navigate, notify, review, setReview }) {
    AI ASSISTANT (SMART DUAL REAL-TIME SOLVER)
 ----------------------------------------------------------- */
 
-function AIAssistant({ subjects, tasks, profile }) {
+function AIAssistant({ subjects, tasks, profile, onActivity }) {
   const [mode, setMode] = useState("ask");
   const [input, setInput] = useState("");
   const [subjectId, setSubjectId] = useState("");
@@ -4265,6 +4460,7 @@ function AIAssistant({ subjects, tasks, profile }) {
       }
 
       setServiceStatus("ready");
+      onActivity("ai_chat", `Asked AI: ${prompt}`, `${selectedSubject?.name || "Study chat"} · ${data.answer.slice(0, 350)}`);
       setMessages((prev) =>
         prev.map((msg) =>
           msg.id === botMsgId ? { ...msg, text: data.answer } : msg
@@ -4324,6 +4520,7 @@ function AIAssistant({ subjects, tasks, profile }) {
       setQuizAnswers({});
       setQuizScore(null);
       setServiceStatus("ready");
+      onActivity("ai_quiz", `Generated quiz: ${topic}`, `${generatedQuiz.length} questions`);
       setMessages((current) =>
         current.map((message) =>
           message.id === botMsgId
@@ -4356,6 +4553,7 @@ function AIAssistant({ subjects, tasks, profile }) {
       .map((question) => `• ${question.question}\n${question.explanation}`)
       .join("\n\n");
     setQuizScore(score);
+    onActivity("quiz_completed", `Completed quiz: ${score}/${quiz.length}`, `${quiz.length} questions`);
     setMessages((current) => [
       ...current,
       {
@@ -4682,7 +4880,7 @@ function Pomodoro({ notify, onStudyComplete }) {
         if (current <= 1) {
           setRunning(false);
           if (mode === "Focus") {
-            onStudyComplete(25);
+            onStudyComplete(25, "Deep work");
             notify("Focus session complete 🔥");
           } else {
             notify("Break complete ✦");
@@ -5101,6 +5299,7 @@ function App() {
       tasks: Array.isArray(plannerData.tasks) ? plannerData.tasks : [],
       exams: Array.isArray(plannerData.exams) ? plannerData.exams : [],
       studySessions: Array.isArray(plannerData.studySessions) ? plannerData.studySessions : [],
+      activityLog: Array.isArray(plannerData.activityLog) ? plannerData.activityLog : [],
     });
     setDashboardPrefs({
       ...initialDashboardPrefs,
@@ -5351,6 +5550,14 @@ function App() {
     }));
   };
 
+  const recordActivity = (kind, title, details = "", entityId = null) => {
+    const createdAt = new Date().toISOString();
+    updateData("activityLog", (entries = []) => [
+      { id: newId(), kind, title: title.slice(0, 300), details: details.slice(0, 500), entityId: entityId ? String(entityId) : "", createdAt },
+      ...(Array.isArray(entries) ? entries : []),
+    ].slice(0, 5000));
+  };
+
   const recordStudySession = (minutes, type = "Focus") => {
     const amount = Math.round(Number(minutes));
     if (!Number.isFinite(amount) || amount <= 0) return;
@@ -5487,6 +5694,7 @@ function App() {
       studySessions={data.studySessions}
       setTasks={(value) => updateData("tasks", value)}
       notify={notify}
+      onActivity={recordActivity}
       preferences={{
         stats: Array.isArray(dashboardPrefs.stats) ? dashboardPrefs.stats : initialDashboardPrefs.stats,
         sections: { ...initialDashboardPrefs.sections, ...dashboardPrefs.sections },
@@ -5497,15 +5705,17 @@ function App() {
   } else if (page === "subjects") {
     view = <Subjects subjects={data.subjects} setSubjects={(val) => updateData("subjects", val)} tasks={data.tasks} notify={notify} />;
   } else if (page === "tasks") {
-    view = <Tasks tasks={data.tasks} setTasks={(val) => updateData("tasks", val)} subjects={data.subjects} notify={notify} />;
+    view = <Tasks tasks={data.tasks} setTasks={(val) => updateData("tasks", val)} subjects={data.subjects} notify={notify} onActivity={recordActivity} />;
   } else if (page === "notes") {
     view = <StudyNotes subjects={data.subjects} onSessionExpired={handleSessionExpired} />;
   } else if (page === "progress") {
     view = <Progress profile={profile || initialProfile} setProfile={setProfile} tasks={data.tasks} subjects={data.subjects} studySessions={data.studySessions} notify={notify} onRecordStudy={recordStudySession} />;
+  } else if (page === "history") {
+    view = <History activityLog={data.activityLog} studySessions={data.studySessions} tasks={data.tasks} />;
   } else if (page === "reminders") {
     view = <Reminders exams={data.exams} setExams={(val) => updateData("exams", val)} tasks={data.tasks} subjects={data.subjects} notify={notify} />;
   } else if (page === "ai") {
-    view = <AIAssistant subjects={data.subjects} tasks={data.tasks} profile={profile || initialProfile} />;
+    view = <AIAssistant subjects={data.subjects} tasks={data.tasks} profile={profile || initialProfile} onActivity={recordActivity} />;
   } else if (page === "pomodoro") {
     view = <Pomodoro notify={notify} onStudyComplete={recordStudySession} />;
   } else if (page === "schedule") {

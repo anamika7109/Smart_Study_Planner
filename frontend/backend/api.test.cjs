@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const baseUrl = process.env.TEST_BASE_URL || "http://localhost:5000";
+const baseUrl = process.env.TEST_BASE_URL || "http://localhost:5003";
 let cookie = "";
 
 async function request(path, options = {}) {
@@ -28,12 +28,21 @@ test("planner and notes API persists a private study workflow", async () => {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       profile: { name: "API Test Student", dailyGoal: 60 },
-      data: { subjects: [], tasks: [], exams: [], studySessions: [] },
+      data: {
+        subjects: [],
+        tasks: [],
+        exams: [],
+        studySessions: [],
+        activityLog: [{ id: "history-test", kind: "task_completed", title: "Completed task: Test", details: "Testing", entityId: "task-1", createdAt: new Date().toISOString() }],
+      },
       dashboardPrefs: { stats: ["today"], sections: { tasks: true, exams: true, subjects: true } },
       flashcardReviews: {},
     }),
   });
   assert.equal(savedPlanner.response.status, 200);
+  const restoredPlanner = await request("/api/planner");
+  assert.equal(restoredPlanner.response.status, 200);
+  assert.equal(restoredPlanner.body.planner.data.activityLog[0].id, "history-test");
 
   const created = await request("/api/notes", {
     method: "POST",

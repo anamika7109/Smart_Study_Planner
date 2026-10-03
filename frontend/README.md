@@ -1,5 +1,11 @@
 # React + Vite
 
+## Run StudyFlow locally
+
+From the `frontend` directory, start the backend with `npm start` and the frontend with `npm run dev` in separate terminals. The frontend runs on port 5173 and proxies `/api` requests to the backend on port 5003.
+
+When MongoDB Atlas is unavailable in development, planner data, notes, and sessions are stored at `%LOCALAPPDATA%\StudyFlow\planner-store.json` and survive backend restarts on this computer. This local fallback does not sync across devices. When MongoDB connects, planner data uses Atlas instead.
+
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
 Currently, two official plugins are available:
