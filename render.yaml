@@ -4,8 +4,9 @@ services:
     runtime: node
     plan: free
     region: singapore
-    buildCommand: npm install --prefix frontend --include=dev && npm ci --prefix frontend/backend && npm run build --prefix frontend -- --outDir ../dist
+    buildCommand: npm ci --prefix frontend --include=dev && npm ci --prefix frontend/backend && npm run build --prefix frontend -- --outDir ../dist --emptyOutDir
     startCommand: npm --prefix frontend/backend start
+    autoDeploy: true
     healthCheckPath: /api/health
     envVars:
       - key: NODE_VERSION
